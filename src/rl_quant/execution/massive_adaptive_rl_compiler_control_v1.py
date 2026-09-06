@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, fields, replace
 import math
 from pathlib import Path
 
@@ -90,12 +90,13 @@ class MassiveAdaptiveRLCompilerControlV1:
 
     def semantic_unsigned(self) -> dict[str, object]:
         return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "semantic_receipt_sha256"
+            descriptor.name: getattr(self, descriptor.name)
+            for descriptor in fields(self)
+            if descriptor.name != "semantic_receipt_sha256"
         }
 
     def validate(self) -> None:
+        semantic = self.semantic_unsigned()
         multipliers = (
             *self.bucket_multipliers,
             self.uncertainty_multiplier,
@@ -126,7 +127,7 @@ class MassiveAdaptiveRLCompilerControlV1:
             or self.implementation_source_sha256
             != MASSIVE_ADAPTIVE_RL_COMPILER_CONTROL_V1_SOURCE_SHA256
             or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            != semantic_sha256(semantic)
         ):
             raise MassiveAdaptiveRLCompilerControlV1Error(
                 "adaptive RL compiler control differs"
@@ -151,7 +152,7 @@ class MassiveAdaptiveRLCompilerControlV1:
             raise MassiveAdaptiveRLCompilerControlV1Error(
                 "neutral adaptive RL action changed the compiler route"
             )
-        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        assert_no_adaptive_hold_semantics(semantic)
 
 
 def apply_massive_adaptive_rl_action_v1(

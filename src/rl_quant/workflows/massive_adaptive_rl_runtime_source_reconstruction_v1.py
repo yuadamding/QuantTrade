@@ -134,6 +134,7 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 im
     authorize_massive_adaptive_rl_runtime_source_graph_authority_v1,
     build_massive_adaptive_rl_typed_authority_inventory_v1,
     load_massive_adaptive_rl_runtime_source_graph_authority_v1,
+    runtime_source_graph_inventory_after_validation_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     MASSIVE_ADAPTIVE_RL_SOURCE_ROLE_REGISTRY_V1,
@@ -142,6 +143,22 @@ from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     bind_massive_adaptive_rl_source_authority_v1,
     load_massive_adaptive_rl_source_bundle_v1,
 )
+
+
+def runtime_source_graph_receipt_after_validation_v1(graph: object) -> str | None:
+    """Derive a graph witness without replaying an already validated graph.
+
+    Production graph authorities expose a private, non-validating receipt helper so
+    callers that have just validated the complete runtime source graph do not walk
+    that graph a second time. A few focused tests use deliberately small protocol
+    fakes; retain their public-property fallback without weakening the production
+    authority's validating public API.
+    """
+
+    unchecked = getattr(graph, "_runtime_authority_receipt_sha256_unchecked", None)
+    if callable(unchecked):
+        return cast(Any, unchecked)()
+    return cast(Any, graph).runtime_authority_receipt_sha256
 
 
 MASSIVE_ADAPTIVE_RL_REPLAY_DEPENDENCY_V1_SCHEMA = (
@@ -156,6 +173,7 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_OBJECT_SNAPSHOT_V1_SCHEMA = (
 MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCES_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-runtime-sources-v1"
 )
+_RUNTIME_SOURCES_V1_ISSUER = object()
 MASSIVE_ADAPTIVE_RL_SUPERVISED_LINEAGE_RUNTIME_SOURCES_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-supervised-lineage-runtime-sources-v1"
 )
@@ -970,7 +988,7 @@ class MassiveAdaptiveRLReplayDependencyIndexV1:
                     keys,
                     key=lambda row: (
                         row[0] == _DEPENDENCY_ROLE,
-                        row[1] or -1,
+                        row[1] if row[1] is not None else -1,
                         row[0],
                         row[2],
                     ),
@@ -1724,6 +1742,7 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
     _replay_decision_roots: tuple[MassiveAdaptiveDecisionRootV1, ...] = field(
         default=(), compare=False, repr=False
     )
+    _issuer: object | None = field(default=None, compare=False, repr=False)
 
     def fold(self, outer_fold_index: int) -> MassiveAdaptiveRLFoldRuntimeSourcesV1:
         if outer_fold_index not in range(len(self.folds)):
@@ -1742,7 +1761,7 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
     ) -> MassiveAdaptiveRLValidationOriginInputsV1:
         """Rebuild one fold's validation roots from persisted replay dependencies."""
 
-        self.validate()
+        require_massive_adaptive_rl_runtime_sources_replayed_v1(self)
         if fold_index not in range(4):
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "adaptive RL validation-origin fold is absent"
@@ -1915,7 +1934,7 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
     ) -> MassiveAdaptiveRLOuterOriginInputsV1:
         """Rebuild one fold's outer roots from the persisted global inventories."""
 
-        self.validate()
+        require_massive_adaptive_rl_runtime_sources_replayed_v1(self)
         if fold_index not in range(4):
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "adaptive RL outer-origin fold is absent"
@@ -1935,14 +1954,28 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
                 "adaptive RL outer-origin context is unavailable"
             )
         expected_dates = candidate_dates[context_start:stop]
-        feature_inventory = self.runtime_source_graph_authority.runtime_authority(
-            role="development-origin-feature-inventory",
-            fold_index=None,
+        inventory = runtime_source_graph_inventory_after_validation_v1(
+            self.runtime_source_graph_authority
         )
-        action_inventory = self.runtime_source_graph_authority.runtime_authority(
-            role="development-origin-action-inventory",
-            fold_index=None,
+        runtime_authorities = (
+            {(row.role, row.fold_index): row.authority for row in inventory}
+            if inventory is not None
+            else None
         )
+        if runtime_authorities is None:
+            feature_inventory = self.runtime_source_graph_authority.runtime_authority(
+                role="development-origin-feature-inventory", fold_index=None
+            )
+            action_inventory = self.runtime_source_graph_authority.runtime_authority(
+                role="development-origin-action-inventory", fold_index=None
+            )
+        else:
+            feature_inventory = runtime_authorities.get(
+                ("development-origin-feature-inventory", None)
+            )
+            action_inventory = runtime_authorities.get(
+                ("development-origin-action-inventory", None)
+            )
         if (
             not isinstance(
                 feature_inventory,
@@ -2144,8 +2177,8 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
         return result
 
     def semantic_unsigned(self) -> dict[str, object]:
-        runtime_receipt = (
-            self.runtime_source_graph_authority.runtime_authority_receipt_sha256
+        runtime_receipt = runtime_source_graph_receipt_after_validation_v1(
+            self.runtime_source_graph_authority
         )
         return {
             "schema": self.schema,
@@ -2219,17 +2252,27 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
         }
 
     def validate(self) -> None:
-        self.runtime_source_graph_authority.validate()
-        runtime_receipt = (
-            self.runtime_source_graph_authority.runtime_authority_receipt_sha256
+        inventory = runtime_source_graph_inventory_after_validation_v1(
+            self.runtime_source_graph_authority
+        )
+        runtime_authorities = (
+            {(row.role, row.fold_index): row.authority for row in inventory}
+            if inventory is not None
+            else None
+        )
+        runtime_receipt = runtime_source_graph_receipt_after_validation_v1(
+            self.runtime_source_graph_authority
         )
         for role, observed in (
             ("development-origin-feature-inventory", self._replay_origin_features),
             ("development-origin-action-inventory", self._replay_action_origins),
         ):
-            predictor_inventory = self.runtime_source_graph_authority.runtime_authority(
-                role=role,
-                fold_index=None,
+            predictor_inventory = (
+                self.runtime_source_graph_authority.runtime_authority(
+                    role=role, fold_index=None
+                )
+                if runtime_authorities is None
+                else runtime_authorities.get((role, None))
             )
             if (
                 not isinstance(
@@ -2254,9 +2297,10 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
             ):
                 predictor_inventory = (
                     self.runtime_source_graph_authority.runtime_authority(
-                        role=role,
-                        fold_index=fold.outer_fold_index,
+                        role=role, fold_index=fold.outer_fold_index
                     )
+                    if runtime_authorities is None
+                    else runtime_authorities.get((role, fold.outer_fold_index))
                 )
                 if (
                     not isinstance(
@@ -2374,6 +2418,36 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
+def require_massive_adaptive_rl_runtime_sources_replayed_v1(
+    runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
+) -> None:
+    """Validate the sealed identity of an already reconstructed runtime graph.
+
+    Reconstruction performs the full recursive validation once. Downstream
+    package stages use this check to retain that exact in-memory witness without
+    repeatedly hashing the complete immutable daily source rectangle. Objects
+    not issued by reconstruction retain the original fail-closed validation.
+    """
+
+    if (
+        type(runtime_sources) is not MassiveAdaptiveRLRuntimeSourcesV1
+        or runtime_sources._issuer is not _RUNTIME_SOURCES_V1_ISSUER
+    ):
+        runtime_sources.validate()
+        return
+    if (
+        not runtime_sources.source_data_qualified
+        or runtime_sources.profitability_reporting_authorized
+        or runtime_sources.lockbox_access_authorized
+        or not runtime_sources.runtime_source_graph_authority.source_data_qualified
+        or runtime_sources.semantic_receipt_sha256
+        != semantic_sha256(runtime_sources.semantic_unsigned())
+    ):
+        raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+            "adaptive RL reconstructed runtime-source seal differs"
+        )
+
+
 def replay_dependency_index_path_v1(
     *, source_root: str | Path, experiment_id: str
 ) -> Path:
@@ -2414,9 +2488,28 @@ def _primary_bindings(
     graph: MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1,
 ) -> tuple[tuple[str, int | None, str, str, object], ...]:
     result: list[tuple[str, int | None, str, str, object]] = []
+    bulk_inventory = getattr(graph, "runtime_authority_inventory", None)
+    runtime_sources = (
+        {
+            (row.role, row.fold_index): row.authority
+            for row in bulk_inventory()
+        }
+        if callable(bulk_inventory)
+        else None
+    )
     for role, spec in MASSIVE_ADAPTIVE_RL_SOURCE_ROLE_REGISTRY_V1.items():
         for fold_index in range(4) if spec.fold_scoped else (None,):
-            authority = graph.runtime_authority(role=role, fold_index=fold_index)
+            if runtime_sources is None:
+                authority = graph.runtime_authority(
+                    role=role, fold_index=fold_index
+                )
+            else:
+                try:
+                    authority = runtime_sources[(role, fold_index)]
+                except KeyError as error:
+                    raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                        "runtime-source graph role is absent"
+                    ) from error
             if isinstance(authority, MassiveAdaptiveRLTypedAuthorityInventoryV1):
                 if authority.runtime_items is None:
                     raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
@@ -2779,12 +2872,17 @@ def _complete_object_graph(
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "replay dependency is not a validated dataclass authority"
             )
-        cast(Any, value).validate()
         receipt = _receipt(value)
-        previous = objects.setdefault(receipt, value)
-        if type(previous) is not type(value) or _encode_value(
-            previous
-        ) != _encode_value(value):
+        previous = objects.get(receipt)
+        if previous is value:
+            continue
+        cast(Any, value).validate()
+        if previous is None:
+            objects[receipt] = value
+            continue
+        if type(previous) is not type(value) or _encode_value(previous) != _encode_value(
+            value
+        ):
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "replay dependency receipt resolves to different objects"
             )
@@ -3918,6 +4016,7 @@ def _reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
         "_replay_action_origins": replay_action_origins,
         "_replay_context_origins": replay_context_origins,
         "_replay_decision_roots": replay_decision_roots,
+        "_issuer": _RUNTIME_SOURCES_V1_ISSUER,
     }
     provisional = MassiveAdaptiveRLRuntimeSourcesV1(
         **body,  # type: ignore[arg-type]
@@ -3983,5 +4082,6 @@ __all__ = [
     "load_massive_adaptive_rl_replay_dependency_index_v1",
     "materialize_massive_adaptive_rl_replay_dependency_index_v1",
     "reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1",
+    "require_massive_adaptive_rl_runtime_sources_replayed_v1",
     "replay_dependency_index_path_v1",
 ]

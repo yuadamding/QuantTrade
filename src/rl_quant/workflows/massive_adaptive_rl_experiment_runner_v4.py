@@ -263,6 +263,9 @@ def _validate_training_handoff(
     manifest: MassiveAdaptiveRLExperimentManifestV4,
     states: tuple[MassiveAdaptiveRLExperimentStateV2, ...],
 ) -> str:
+    # V2 reserves source_data_qualified for its terminal report binding. Its
+    # ordinary training state records only the fit receipt; the fit authority
+    # must be independently replayed before validation inputs can be opened.
     if not states or any(
         state.experiment_id != manifest.experiment_id
         or state.manifest_receipt_sha256
@@ -281,7 +284,6 @@ def _validate_training_handoff(
     if (
         len(matches) != 1
         or matches[0].stage_artifact_receipt_sha256 is None
-        or not matches[0].source_data_qualified
         or not any(
             state.stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
             and state.blocker_code == "inner-validation-backend-required"

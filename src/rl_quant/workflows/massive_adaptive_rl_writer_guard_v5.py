@@ -62,6 +62,7 @@ _TRAINING_SOURCE_DIRECTORIES = frozenset(
         "checkpoint-v1",
         "prequential-ppo-checkpoint-v1",
         "rl-checkpoint-v1",
+        "rl-execution-environment-authority-v1",
         "rl-fixed-control-fit-v1",
         "rl-fixed-control-selection-v1",
         "rl-fit-forecast-archive-v1",

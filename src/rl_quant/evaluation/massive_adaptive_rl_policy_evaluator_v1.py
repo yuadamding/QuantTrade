@@ -37,6 +37,7 @@ from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
 )
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
+    _PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     build_massive_adaptive_rl_policy_trace_v1,
 )
 
@@ -448,6 +449,7 @@ def evaluate_massive_adaptive_rl_checkpoint_v1(
         transitions=tuple(transitions),
         frozen_targets_replayed=False,
         evaluation_role=evaluation_role,
+        _transition_validation_token=_PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     )
     source_qualified = bool(
         checkpoint_authority.source_data_qualified

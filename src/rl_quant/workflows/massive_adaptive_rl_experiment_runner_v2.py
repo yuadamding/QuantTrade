@@ -72,6 +72,9 @@ from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     MassiveAdaptiveRLSourceBundleV1Error,
     load_massive_adaptive_rl_source_bundle_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_scope_v1 import (
+    massive_adaptive_rl_vertical_qualification_scope_active_v1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_END_TO_END_RUN_V2_SCHEMA = (
@@ -780,6 +783,12 @@ def _run_massive_adaptive_rl_experiment_v2_unlocked(
             runtime_source_graph=runtime_source_graph,
         )
     except (ValueError, RuntimeError):
+        if massive_adaptive_rl_vertical_qualification_scope_active_v1():
+            # Qualification must expose the exact failing implementation
+            # boundary.  Production runs retain their immutable failed-state
+            # response, while the reserved synthetic namespace raises into
+            # pytest so a broad runner catch cannot hide a broken vertical.
+            raise
         failure = fail_massive_adaptive_rl_experiment_state_v2(
             artifact_root=artifact_root,
             previous=states[-1],

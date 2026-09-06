@@ -44,6 +44,7 @@ from rl_quant.evaluation.massive_adaptive_inference_plan_v1 import (
 )
 from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
     MassiveAdaptiveProfitabilityEnvV1,
+    _PREVALIDATED_PROFITABILITY_ENV_SOURCE_ROOTS_V1,
 )
 from rl_quant.features.massive_adaptive_context_origin_authority_v1 import (
     MassiveAdaptiveContextOriginAuthorityV1,
@@ -86,6 +87,7 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 imp
     MassiveAdaptiveRLSupervisedLineageSourcesV1,
     MassiveAdaptiveRLRuntimeSourcesV1,
     MassiveAdaptiveRLValidationOriginInputsV1,
+    require_massive_adaptive_rl_runtime_sources_replayed_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     MassiveAdaptiveRLManifestV5WriterCapabilityV1,
@@ -528,7 +530,7 @@ def _validation_sources_facts(
         )
     manifest.validate()
     four_fold.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     runtime.origin_inputs.validate()
     fold_index = runtime.inference_plan.fold_index
     if fold_index not in range(4):
@@ -1084,7 +1086,7 @@ def _validation_sources_runtime(
         )
     manifest.validate()
     four_fold_fit_authority.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     if (
         fold_index not in manifest.base_manifest.base_manifest.fold_indices
         or manifest.experiment_id != runtime_sources.experiment_id
@@ -1532,6 +1534,9 @@ def _validation_environment(
         initial_capital=economics.primary_capital,
         transaction_cost_basis_points=transaction_cost_basis_points,
         maximum_fill_participation=economics.maximum_fill_participation,
+        _source_validation_token=(
+            _PREVALIDATED_PROFITABILITY_ENV_SOURCE_ROOTS_V1
+        ),
     )
 
 
@@ -1978,7 +1983,7 @@ def _build_validation_environment_registry(
         )
     manifest.validate()
     validation_sources.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     fold_index = validation_sources.fold_index
     runtime_receipt = (
         runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256

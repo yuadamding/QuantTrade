@@ -31,6 +31,7 @@ from rl_quant.training.massive_adaptive_rl_fixed_control_fit_runner_v1 import (
 )
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
+    _PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     build_massive_adaptive_rl_policy_trace_from_identities_v1,
 )
 
@@ -253,6 +254,7 @@ def evaluate_massive_adaptive_rl_fixed_control_v1(
             and fit_authority.development_control_fit_authorized
             and chronology_authority.development_policy_selection_authorized
         ),
+        _transition_validation_token=_PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     )
     transition_receipts = tuple(row.semantic_receipt_sha256 for row in transitions)
     provisional = MassiveAdaptiveRLFixedControlEvaluationV1(

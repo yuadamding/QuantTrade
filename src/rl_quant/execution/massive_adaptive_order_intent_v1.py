@@ -74,6 +74,7 @@ class MassiveAdaptiveOrderIntentV1:
         }
 
     def validate(self) -> None:
+        semantic = self.semantic_unsigned()
         if (
             self.schema != MASSIVE_ADAPTIVE_ORDER_INTENT_V1_SCHEMA
             or not self.decision_session_date
@@ -84,12 +85,12 @@ class MassiveAdaptiveOrderIntentV1:
             or self.row_inventory_sha256
             != semantic_sha256(tuple(row.receipt_sha256 for row in self.rows))
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(semantic)
         ):
             raise MassiveAdaptiveOrderIntentV1Error("adaptive order intent differs")
         for row in self.rows:
             row.validate()
-        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        assert_no_adaptive_hold_semantics(semantic)
 
 
 def build_massive_adaptive_order_intent_v1(

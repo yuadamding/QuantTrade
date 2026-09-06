@@ -40,6 +40,7 @@ MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SOLVER = (
 _BUCKET_IDS = tuple(row.bucket_id for row in MASSIVE_ADAPTIVE_ALPHA_V1_BUCKETS)
 _SQRT_SESSIONS_PER_YEAR = math.sqrt(252.0)
 _HEX = frozenset(string.hexdigits.lower())
+_FROZEN_ADAPTIVE_ALPHA_PROTOCOL_V1 = MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL
 
 
 class MassiveAdaptivePortfolioCompilerError(ValueError):
@@ -327,10 +328,7 @@ class MassiveAdaptivePortfolioCompilerInputsV1:
             raise MassiveAdaptivePortfolioCompilerError(
                 "compiler input does not bind the frozen adaptive-alpha protocol"
             )
-        # Reference the singleton as well as its receipt so this module cannot
-        # silently run after an in-process protocol substitution.
-        MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL.validate()
-        if MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL.receipt_sha256 != self.protocol_receipt_sha256:
+        if MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL is not _FROZEN_ADAPTIVE_ALPHA_PROTOCOL_V1:
             raise MassiveAdaptivePortfolioCompilerError("adaptive protocol root drifted")
         assert_no_adaptive_hold_semantics(self)
         del expected
@@ -629,7 +627,14 @@ class _FeasibleProjector:
         active = values - self.benchmark
         coordinates = self.eigenvectors.T @ active
         quadratic = float(np.sum(self.eigenvalues * coordinates * coordinates))
-        if quadratic <= radius * radius + self.tolerance:
+        primal_tolerance = max(self.tolerance * 10.0, 1.0e-11)
+        annual_tracking_error = _SQRT_SESSIONS_PER_YEAR * math.sqrt(
+            max(quadratic, 0.0)
+        )
+        if (
+            annual_tracking_error
+            <= self.tracking_error_limit_annualized + primal_tolerance
+        ):
             return values.copy()
         positive = self.eigenvalues > self.tolerance
         if not bool(positive.any()):
@@ -659,19 +664,64 @@ class _FeasibleProjector:
     def _projections(
         self,
     ) -> tuple[Callable[[NDArray[np.float64]], NDArray[np.float64]], ...]:
-        return (
-            lambda values: np.clip(values, self.lower, self.upper),
-            self._project_risky_sum,
-            self._project_issuer_caps,
-            lambda values: _project_positive_change(
-                values, self.anchor, self.turnover_limit
-            ),
-            lambda values: _project_negative_change(
-                values, self.anchor, self.turnover_limit
-            ),
-            self._project_beta,
-            self._project_tracking_error,
+        projections: list[
+            Callable[[NDArray[np.float64]], NDArray[np.float64]]
+        ] = [lambda values: np.clip(values, self.lower, self.upper)]
+        if float(self.upper.sum()) > 1.0 + self.tolerance:
+            projections.append(self._project_risky_sum)
+        if any(
+            float(self.upper[indexes].sum()) > self.issuer_cap + self.tolerance
+            for indexes in self.issuer_groups
+        ):
+            projections.append(self._project_issuer_caps)
+        if (
+            float(np.maximum(self.upper - self.anchor, 0.0).sum())
+            > self.turnover_limit + self.tolerance
+        ):
+            projections.append(
+                lambda values: _project_positive_change(
+                    values, self.anchor, self.turnover_limit
+                )
+            )
+        if (
+            float(np.maximum(self.anchor - self.lower, 0.0).sum())
+            > self.turnover_limit + self.tolerance
+        ):
+            projections.append(
+                lambda values: _project_negative_change(
+                    values, self.anchor, self.turnover_limit
+                )
+            )
+        lower_active = self.lower - self.benchmark
+        upper_active = self.upper - self.benchmark
+        minimum_beta = float(
+            np.where(self.beta >= 0.0, lower_active, upper_active) @ self.beta
         )
+        maximum_beta = float(
+            np.where(self.beta >= 0.0, upper_active, lower_active) @ self.beta
+        )
+        if (
+            minimum_beta < -self.beta_limit - self.tolerance
+            or maximum_beta > self.beta_limit + self.tolerance
+        ):
+            projections.append(self._project_beta)
+        maximum_absolute_active = np.maximum(
+            np.abs(lower_active), np.abs(upper_active)
+        )
+        tracking_variance_upper_bound = float(
+            maximum_absolute_active
+            @ np.abs(self.covariance)
+            @ maximum_absolute_active
+        )
+        maximum_annual_tracking_error = _SQRT_SESSIONS_PER_YEAR * math.sqrt(
+            max(tracking_variance_upper_bound, 0.0)
+        )
+        if maximum_annual_tracking_error > (
+            self.tracking_error_limit_annualized
+            + max(self.tolerance * 10.0, 1.0e-11)
+        ):
+            projections.append(self._project_tracking_error)
+        return tuple(projections)
 
     def primal_residual(self, values: NDArray[np.float64]) -> float:
         active = values - self.benchmark
@@ -971,6 +1021,18 @@ def compile_massive_adaptive_portfolio_v1(
         tail_risk_aversion=resolved.tail_risk_aversion,
         tail_confidence=resolved.tail_confidence,
     )
+    # A small absolute envelope prevents a strict-tolerance projected step
+    # from crawling forever along a flat feasible face.  Do not scale a
+    # deliberately coarse configured tolerance by the security count: doing
+    # so can turn (for example) a 1% solve tolerance into a 20% movement and
+    # prematurely accept an economically material first step.
+    movement_convergence_tolerance = max(
+        resolved.numerical_tolerance,
+        min(
+            resolved.numerical_tolerance * max(count, 20),
+            2.0e-8,
+        ),
+    )
 
     converged = False
     iteration = 0
@@ -992,6 +1054,7 @@ def compile_massive_adaptive_portfolio_v1(
         local_step = resolved.solver_step_size
         candidate = weights
         candidate_components = components
+        movement = math.inf
         accepted = False
         for _ in range(24):
             try:
@@ -1018,8 +1081,15 @@ def compile_massive_adaptive_portfolio_v1(
                 tail_risk_aversion=resolved.tail_risk_aversion,
                 tail_confidence=resolved.tail_confidence,
             )
-            if candidate_components.objective >= (
-                components.objective - resolved.numerical_tolerance
+            movement = float(
+                np.max(np.abs(candidate - weights), initial=0.0)
+            )
+            objective_gain = (
+                candidate_components.objective - components.objective
+            )
+            if objective_gain > resolved.numerical_tolerance or (
+                movement <= movement_convergence_tolerance
+                and objective_gain >= -resolved.numerical_tolerance
             ):
                 accepted = True
                 break
@@ -1028,10 +1098,9 @@ def compile_massive_adaptive_portfolio_v1(
             raise MassiveAdaptivePortfolioCompilerError(
                 "portfolio objective could not find a nondecreasing feasible step"
             )
-        movement = float(np.max(np.abs(candidate - weights), initial=0.0))
         weights = candidate
         components = candidate_components
-        if movement <= resolved.numerical_tolerance:
+        if movement <= movement_convergence_tolerance:
             converged = True
             break
     if not converged:

@@ -66,6 +66,8 @@ from rl_quant.workflows.massive_adaptive_rl_fold_fit_inputs_v1 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
     MassiveAdaptiveRLRuntimeSourcesV1,
+    require_massive_adaptive_rl_runtime_sources_replayed_v1,
+    runtime_source_graph_receipt_after_validation_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_process_state_v1 import (
     preserve_massive_adaptive_rl_process_rng_state_v1,
@@ -345,7 +347,9 @@ class MassiveAdaptiveRLFoldFitAuthorityV1:
             assert self._manifest is not None
             assert self._runtime_sources is not None
             self._manifest.validate()
-            self._runtime_sources.validate()
+            require_massive_adaptive_rl_runtime_sources_replayed_v1(
+                self._runtime_sources
+            )
         if self._loaded_source is not None:
             self._loaded_source.validate()
         workflow = self.training_workflow.runtime_workflow
@@ -430,7 +434,9 @@ class MassiveAdaptiveRLFoldFitAuthorityV1:
         runtime_receipt = (
             None
             if self._runtime_sources is None
-            else self._runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+            else runtime_source_graph_receipt_after_validation_v1(
+                self._runtime_sources.runtime_source_graph_authority
+            )
         )
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SCHEMA
@@ -623,8 +629,8 @@ def _assemble_massive_adaptive_rl_fold_fit_authority_v1(
         )
         for checkpoint in policy_authorities
     )
-    runtime_receipt = (
-        runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+    runtime_receipt = runtime_source_graph_receipt_after_validation_v1(
+        runtime_sources.runtime_source_graph_authority
     )
     if runtime_receipt is None or not policy_authorities:
         raise MassiveAdaptiveRLFoldFitV1Error(
@@ -729,7 +735,7 @@ def prepare_massive_adaptive_rl_fold_fit_inputs_v1(
     """Persist or replay one fold's complete inputs before PPO execution."""
 
     manifest.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     selected_device = torch.device(
         manifest.execution_device_specification if device is None else device
     )
@@ -1018,7 +1024,7 @@ def _verify_massive_adaptive_rl_fold_fit_authority_v1_unpreserved(
     """Reconstruct a completed fold strictly from existing immutable evidence."""
 
     manifest.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     selected_device = torch.device(
         manifest.execution_device_specification if device is None else device
     )

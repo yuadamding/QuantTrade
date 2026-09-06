@@ -23,6 +23,9 @@ from rl_quant.execution.massive_adaptive_economic_book_v1 import (
 from rl_quant.evaluation.massive_adaptive_economic_step_v1 import (
     MassiveAdaptiveEconomicStepV1,
     MassiveAdaptivePreparedStepV1,
+    _DEFER_ECONOMIC_STEP_RESULT_VALIDATION_V1,
+    _PREVALIDATED_ECONOMIC_SOURCE_ROOTS_V1,
+    _PREVALIDATED_PREPARATION_SOURCE_ROOTS_V1,
     prepare_massive_adaptive_economic_step_v1,
     settle_massive_adaptive_economic_step_v1,
 )
@@ -87,6 +90,9 @@ class MassiveAdaptiveProfitabilityEnvV1Error(ValueError):
     """The environment chronology, state, or economic transition differs."""
 
 
+_PREVALIDATED_PROFITABILITY_ENV_SOURCE_ROOTS_V1 = object()
+
+
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveProfitabilityEnvStateV1:
     chronology_cursor: int
@@ -109,6 +115,7 @@ class MassiveAdaptiveProfitabilityEnvStateV1:
         }
 
     def validate(self) -> None:
+        semantic = self.semantic_unsigned()
         for value in (
             self.strategy_book,
             self.neutral_book,
@@ -122,12 +129,12 @@ class MassiveAdaptiveProfitabilityEnvStateV1:
             or self.chronology_cursor < 0
             or not isinstance(self.done, bool)
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(semantic)
         ):
             raise MassiveAdaptiveProfitabilityEnvV1Error(
                 "adaptive profitability environment state differs"
             )
-        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        assert_no_adaptive_hold_semantics(semantic)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +175,7 @@ class MassiveAdaptiveRLTransitionV1:
         }
 
     def validate(self) -> None:
+        semantic = self.semantic_unsigned()
         self.compiler_control.validate()
         self.policy_decision.validate()
         self.neutral_decision.validate()
@@ -198,12 +206,12 @@ class MassiveAdaptiveRLTransitionV1:
             or self.lockbox_access_authorized
             or self.reinforcement_learning_authorized
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(semantic)
         ):
             raise MassiveAdaptiveProfitabilityEnvV1Error(
                 "adaptive RL transition differs"
             )
-        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        assert_no_adaptive_hold_semantics(semantic)
 
 
 def _state(
@@ -260,18 +268,26 @@ class MassiveAdaptiveProfitabilityEnvV1:
         transaction_cost_basis_points: float = 20.0,
         maximum_fill_participation: float = 0.02,
         compiler_config: MassiveAdaptivePortfolioCompilerConfigV1 | None = None,
+        _source_validation_token: object | None = None,
     ) -> None:
         for value in (
             forecast_archive,
             calibration,
             inference_plan,
-            fill_source,
-            daily_input_authority,
-            identity_authority,
         ):
             value.validate()
-        if economic_event_archive is not None:
-            economic_event_archive.validate()
+        if _source_validation_token is None:
+            for value in (fill_source, daily_input_authority, identity_authority):
+                value.validate()
+            if economic_event_archive is not None:
+                economic_event_archive.validate()
+        elif (
+            _source_validation_token
+            is not _PREVALIDATED_PROFITABILITY_ENV_SOURCE_ROOTS_V1
+        ):
+            raise MassiveAdaptiveProfitabilityEnvV1Error(
+                "adaptive profitability environment source-validation token differs"
+            )
         if (
             not math.isfinite(initial_capital)
             or initial_capital <= 0.0
@@ -370,6 +386,23 @@ class MassiveAdaptiveProfitabilityEnvV1:
         self._state: MassiveAdaptiveProfitabilityEnvStateV1 | None = None
         self._prepared: MassiveAdaptivePreparedStepV1 | None = None
         self._observation: MassiveAdaptiveRLObservationV1 | None = None
+        # The immutable source authorities were validated at the start of this
+        # constructor. Shallow episode copies retain those exact objects and may
+        # reset repeatedly without rescanning the complete daily rectangle.
+        self._source_roots_validated = True
+
+    def _validate_economic_source_roots(self) -> None:
+        if self._source_roots_validated:
+            return
+        for value in (
+            self.fill_source,
+            self.daily_input_authority,
+            self.identity_authority,
+        ):
+            value.validate()
+        if self.economic_event_archive is not None:
+            self.economic_event_archive.validate()
+        self._source_roots_validated = True
 
     def _prepare_observation(self) -> MassiveAdaptiveRLObservationV1:
         if self._state is None or self._state.done:
@@ -389,6 +422,7 @@ class MassiveAdaptiveProfitabilityEnvV1:
             benchmark_book=self._state.benchmark_book,
             daily_input_authority=self.daily_input_authority,
             identity_authority=self.identity_authority,
+            _source_validation_token=_PREVALIDATED_PREPARATION_SOURCE_ROOTS_V1,
         )
         self._observation = build_massive_adaptive_rl_observation_v1(
             prepared=self._prepared,
@@ -400,6 +434,7 @@ class MassiveAdaptiveProfitabilityEnvV1:
     def reset(
         self,
     ) -> tuple[MassiveAdaptiveRLObservationV1, dict[str, object]]:
+        self._validate_economic_source_roots()
         first_date = self.inference_plan.rows[0].decision_session_date
         initial = build_massive_adaptive_initial_book_authority_v1(
             decision_session_date=first_date,
@@ -441,6 +476,7 @@ class MassiveAdaptiveProfitabilityEnvV1:
         return self._observation
 
     def restore(self, state: MassiveAdaptiveProfitabilityEnvStateV1) -> None:
+        self._validate_economic_source_roots()
         state.validate()
         if (
             state.source_inventory_sha256 != self.source_inventory_sha256
@@ -466,6 +502,7 @@ class MassiveAdaptiveProfitabilityEnvV1:
         grants no authority by itself.
         """
 
+        self._validate_economic_source_roots()
         state.validate()
         first_date = self.inference_plan.rows[0].decision_session_date
         books = (state.strategy_book, state.neutral_book, state.benchmark_book)
@@ -521,6 +558,10 @@ class MassiveAdaptiveProfitabilityEnvV1:
             raise MassiveAdaptiveProfitabilityEnvV1Error("environment is not reset")
         if self._state.done:
             raise MassiveAdaptiveProfitabilityEnvV1Error("environment is terminal")
+        if not self._source_roots_validated:
+            raise MassiveAdaptiveProfitabilityEnvV1Error(
+                "environment economic source roots were not validated at reset"
+            )
         if not isinstance(continue_economic_episode, bool):
             raise MassiveAdaptiveProfitabilityEnvV1Error(
                 "adaptive continuation flag is invalid"
@@ -567,6 +608,8 @@ class MassiveAdaptiveProfitabilityEnvV1:
             policy_control_receipt_sha256=control.semantic_receipt_sha256,
             policy_control=control,
             frozen_targets_replayed=frozen_decision is not None,
+            _source_validation_token=_PREVALIDATED_ECONOMIC_SOURCE_ROOTS_V1,
+            _result_validation_token=_DEFER_ECONOMIC_STEP_RESULT_VALIDATION_V1,
         )
         next_cursor = self._state.chronology_cursor + 1
         local_end = next_cursor == len(self.inference_plan.rows)

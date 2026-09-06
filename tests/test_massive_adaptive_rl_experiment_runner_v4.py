@@ -25,8 +25,16 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v4 import (
     verify_massive_adaptive_rl_experiment_v4,
 )
 from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
+    MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2,
     MassiveAdaptiveRLExperimentStageV2,
     MassiveAdaptiveRLExperimentStateV2,
+    advance_massive_adaptive_rl_experiment_state_v2,
+    block_massive_adaptive_rl_experiment_state_v2,
+    load_massive_adaptive_rl_experiment_states_v2,
+    register_massive_adaptive_rl_experiment_state_v2,
+)
+from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
+    _training_lineage_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_four_fold_fit_v1 import (
     MassiveAdaptiveRLFourFoldFitAuthorityV1,
@@ -34,6 +42,9 @@ from rl_quant.workflows.massive_adaptive_rl_four_fold_fit_v1 import (
 from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
     build_massive_adaptive_rl_experiment_manifest_v4,
     write_massive_adaptive_rl_experiment_manifest_v4,
+)
+from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
+    build_massive_adaptive_rl_experiment_manifest_v5,
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v2 import (
     MassiveAdaptiveRLRuntimeSourcesV2,
@@ -58,7 +69,7 @@ def _states(manifest):
     common = {
         "experiment_id": manifest.experiment_id,
         "manifest_receipt_sha256": manifest.base_manifest.semantic_receipt_sha256,
-        "source_data_qualified": True,
+        "source_data_qualified": False,
     }
     trained = _typed_shell(
         MassiveAdaptiveRLExperimentStateV2,
@@ -142,6 +153,53 @@ def test_prequential_result_stops_before_outcomes_and_outer(
     assert not result.outer_access_authorized
     assert not result.profitability_reporting_authorized
     assert not result.end_to_end_profitability_execution_complete
+
+
+def test_real_training_ledger_handoff_does_not_require_terminal_report(
+    tmp_path: Path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="runner-v5-real-training-handoff"
+    )
+    state = register_massive_adaptive_rl_experiment_state_v2(
+        artifact_root=tmp_path,
+        experiment_id=manifest.experiment_id,
+        manifest_receipt_sha256=(
+            manifest.base_manifest.base_manifest.semantic_receipt_sha256
+        ),
+    )
+    for stage in MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[1:4]:
+        state = advance_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=tmp_path,
+            previous=state,
+            stage=stage,
+            stage_artifact_receipt_sha256=_digest(stage.value),
+        )
+    trained = state
+    assert trained.stage is (
+        MassiveAdaptiveRLExperimentStageV2.PPO_AND_FIXED_CONTROLS_TRAINED
+    )
+    block_massive_adaptive_rl_experiment_state_v2(
+        artifact_root=tmp_path,
+        previous=trained,
+        blocked_stage=MassiveAdaptiveRLExperimentStageV2.INNER_VALIDATION_COMPLETED,
+        blocker_code="inner-validation-backend-required",
+        blocker_evidence_receipt_sha256=_digest("backend-required"),
+    )
+    states = load_massive_adaptive_rl_experiment_states_v2(
+        artifact_root=tmp_path, experiment_id=manifest.experiment_id
+    )
+    for state in states:
+        state.validate()
+        assert not state.source_data_qualified
+        assert not state.execution_complete
+    assert _validate_training_handoff(
+        manifest=manifest.base_manifest, states=states
+    ) == trained.stage_artifact_receipt_sha256
+    assert _training_lineage_v1(root=tmp_path, manifest=manifest) == (
+        trained.semantic_receipt_sha256,
+        trained.stage_artifact_receipt_sha256,
+    )
 
 
 def test_training_handoff_requires_the_exact_backend_blocker() -> None:

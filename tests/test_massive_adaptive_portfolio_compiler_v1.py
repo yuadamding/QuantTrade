@@ -262,6 +262,80 @@ def test_integrated_book_respects_issuer_beta_tracking_error_and_turnover() -> N
     assert decision.primal_residual <= 2.0e-8
 
 
+def test_tracking_projection_uses_annualized_primal_tolerance() -> None:
+    """A variance-space tolerance must not hide an annualized violation."""
+
+    projector = compiler_module._FeasibleProjector.build(
+        lower=np.asarray((0.0,), dtype=np.float64),
+        upper=np.asarray((1.0,), dtype=np.float64),
+        anchor=np.asarray((0.0,), dtype=np.float64),
+        benchmark=np.asarray((0.0,), dtype=np.float64),
+        issuer_ids=("ISSUER-00",),
+        issuer_cap=1.0,
+        turnover_limit=1.0,
+        beta=np.asarray((0.0,), dtype=np.float64),
+        beta_limit=1.0,
+        covariance=np.asarray(((1.0 / 252.0,),), dtype=np.float64),
+        tracking_error_limit_annualized=0.06,
+        max_iterations=500,
+        tolerance=1.0e-9,
+    )
+
+    projected, _iterations = projector.project(
+        np.asarray((0.0600000117,), dtype=np.float64)
+    )
+
+    assert projector.primal_residual(projected) <= 1.0e-8
+    assert projected[0] == pytest.approx(0.06, abs=1.0e-10)
+
+
+def test_objective_backtracking_settles_at_a_pretrade_kink() -> None:
+    """A negligible objective change must not sustain a finite-step cycle."""
+
+    inputs = _inputs(
+        expected_first_bucket=(0.02, 0.02),
+        pretrade=(0.5, 0.5),
+        benchmark=(0.5, 0.5),
+        entry_cost_bps=(90.0, 100.0),
+    )
+
+    decision = compile_massive_adaptive_portfolio_v1(
+        inputs,
+        config=_config(
+            solver_step_size=0.25,
+            solver_max_iterations=50,
+            numerical_tolerance=1.0e-9,
+        ),
+    )
+
+    assert decision.target_weights == pytest.approx((0.5, 0.5), abs=2.0e-8)
+    assert decision.converged is True
+    assert decision.solver_iterations == 1
+
+
+def test_immaterial_flat_face_gain_retains_the_feasible_book() -> None:
+    """A sub-envelope movement must not create a long rebalance crawl."""
+
+    inputs = _inputs(
+        expected_first_bucket=(0.02, 0.02000003),
+        pretrade=(0.5, 0.5),
+        benchmark=(0.5, 0.5),
+    )
+
+    decision = compile_massive_adaptive_portfolio_v1(
+        inputs,
+        config=_config(
+            solver_step_size=0.25,
+            solver_max_iterations=50,
+            numerical_tolerance=1.0e-9,
+        ),
+    )
+
+    assert decision.target_weights == pytest.approx((0.5, 0.5), abs=2.0e-8)
+    assert decision.converged is True
+    assert decision.solver_iterations == 1
+
+
 def test_bucket_choice_is_diagnostic_and_recomputed_from_the_full_curve() -> None:
     expected = np.asarray([[0.01, -0.02, 0.04, -0.01, 0.0, 0.0, 0.0]])
     inputs = _inputs(

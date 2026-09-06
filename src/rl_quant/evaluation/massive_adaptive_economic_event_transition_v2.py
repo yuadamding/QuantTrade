@@ -30,6 +30,7 @@ from rl_quant.features.massive_economic_event_source_v5 import (
 )
 from rl_quant.features.massive_profitability_daily_input_authority_v1 import (
     MassiveProfitabilityDailyInputAuthorityV1,
+    MassiveProfitabilityDailyInputAuthorityV1Error,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
@@ -44,6 +45,9 @@ MASSIVE_ADAPTIVE_ECONOMIC_EVENT_TRANSITION_V2_SCHEMA = (
 
 class MassiveAdaptiveEconomicEventTransitionV2Error(ValueError):
     """The fill-start or close event snapshot is not source-causal."""
+
+
+_PREVALIDATED_EVENT_SOURCE_ROOTS_V2 = object()
 
 
 def _identity_scope(
@@ -155,6 +159,7 @@ def build_massive_adaptive_economic_event_transition_v2(
     provider_archive: MassiveProviderEconomicArchiveAuthorityV6,
     daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
     identity_authority: PITSecurityUniverseAuthority,
+    _source_validation_token: object | None = None,
 ) -> MassiveAdaptiveEconomicEventTransitionV2:
     """Resolve independent fill-start and close as-of snapshots."""
 
@@ -162,21 +167,27 @@ def build_massive_adaptive_economic_event_transition_v2(
         raise MassiveAdaptiveEconomicEventTransitionV2Error(
             "economic transition v2 requires the package-owned V6 archive"
         )
-    try:
-        provider_archive.validate()
-    except MassiveEconomicAuthorityV6Error as exc:
+    if _source_validation_token is None:
+        try:
+            provider_archive.validate()
+        except MassiveEconomicAuthorityV6Error as exc:
+            raise MassiveAdaptiveEconomicEventTransitionV2Error(
+                "economic event archive failed source replay validation"
+            ) from exc
+        daily_input_authority.validate()
+        identity_authority.validate()
+    elif _source_validation_token is not _PREVALIDATED_EVENT_SOURCE_ROOTS_V2:
         raise MassiveAdaptiveEconomicEventTransitionV2Error(
-            "economic event archive failed source replay validation"
-        ) from exc
-    daily_input_authority.validate()
-    identity_authority.validate()
-    sessions = {
-        row.source_session_date: row for row in daily_input_authority.sessions
-    }
+            "economic transition source-validation token differs"
+        )
     try:
-        prior_close = sessions[prior_session_date].regular_close_at_ms
-        fill_close = sessions[fill_session_date].regular_close_at_ms
-    except (KeyError, AttributeError) as exc:
+        prior_close = daily_input_authority.session(
+            session_date=prior_session_date
+        ).regular_close_at_ms
+        fill_close = daily_input_authority.session(
+            session_date=fill_session_date
+        ).regular_close_at_ms
+    except (KeyError, AttributeError, MassiveProfitabilityDailyInputAuthorityV1Error) as exc:
         raise MassiveAdaptiveEconomicEventTransitionV2Error(
             "economic transition sessions are outside the daily authority"
         ) from exc

@@ -760,6 +760,11 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
     @property
     def runtime_authority_receipt_sha256(self) -> str | None:
         self.validate()
+        return self._runtime_authority_receipt_sha256_unchecked()
+
+    def _runtime_authority_receipt_sha256_unchecked(self) -> str | None:
+        """Derive the witness receipt after the caller validates this graph."""
+
         if self._runtime_source_bundle is None or self._runtime_sources is None:
             return None
         return semantic_sha256(
@@ -791,14 +796,10 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
     ) -> MassiveAdaptiveRLSourceAuthorityProtocol:
         """Return one concrete witness only after the complete graph replays."""
 
-        self.validate()
-        if self._runtime_sources is None:
-            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
-                "adaptive RL runtime source graph has no concrete replay witness"
-            )
+        runtime_sources = self.runtime_authority_inventory()
         matches = tuple(
             runtime.authority
-            for runtime in self._runtime_sources
+            for runtime in runtime_sources
             if runtime.role == role and runtime.fold_index == fold_index
         )
         if len(matches) != 1:
@@ -806,6 +807,25 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
                 "adaptive RL runtime source graph role is absent or duplicated"
             )
         return matches[0]
+
+    def runtime_authority_inventory(
+        self,
+    ) -> tuple[MassiveAdaptiveRLRoleBoundSourceAuthorityV1, ...]:
+        """Return the complete concrete witness after one graph validation."""
+
+        self.validate()
+        return self._runtime_authority_inventory_unchecked()
+
+    def _runtime_authority_inventory_unchecked(
+        self,
+    ) -> tuple[MassiveAdaptiveRLRoleBoundSourceAuthorityV1, ...]:
+        """Return witnesses after an enclosing authority validated this graph."""
+
+        if self._runtime_sources is None:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL runtime source graph has no concrete replay witness"
+            )
+        return self._runtime_sources
 
     def semantic_unsigned(self) -> dict[str, object]:
         payload = asdict(
@@ -995,6 +1015,18 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
+def runtime_source_graph_inventory_after_validation_v1(
+    graph: MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1,
+) -> tuple[MassiveAdaptiveRLRoleBoundSourceAuthorityV1, ...] | None:
+    """Reuse a concrete witness already validated by its enclosing root."""
+
+    unchecked = getattr(graph, "_runtime_authority_inventory_unchecked", None)
+    if callable(unchecked):
+        return unchecked()
+    inventory = getattr(graph, "runtime_authority_inventory", None)
+    return inventory() if callable(inventory) else None
+
+
 def _validate_domain_runtime(
     *,
     key: tuple[str, int | None],
@@ -1014,7 +1046,6 @@ def _validate_domain_runtime(
         raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
             "adaptive RL runtime source concrete domain type differs"
         )
-    runtime.authority.validate()
     if isinstance(runtime.authority, MassiveAdaptiveRLTypedAuthorityInventoryV1):
         if (
             runtime.authority.role != runtime.role
@@ -2206,7 +2237,7 @@ def authorize_massive_adaptive_rl_runtime_source_graph_authority_v1(
                 runtime_sources,
                 key=lambda value: (
                     value[1] is not None,
-                    value[1] or -1,
+                    -1 if value[1] is None else value[1],
                     value[0],
                 ),
             )
@@ -2228,5 +2259,6 @@ __all__ = [
     "build_massive_adaptive_rl_typed_authority_inventory_v1",
     "load_massive_adaptive_rl_runtime_source_graph_authority_v1",
     "materialize_massive_adaptive_rl_runtime_source_graph_authority_v1",
+    "runtime_source_graph_inventory_after_validation_v1",
     "runtime_source_graph_authority_path_v1",
 ]

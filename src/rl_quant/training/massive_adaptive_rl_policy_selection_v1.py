@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from io import BytesIO
 import json
 import math
@@ -77,6 +77,9 @@ class MassiveAdaptiveRLPolicySelectionV1Error(ValueError):
     """RL validation traces, candidates, or committed selection differ."""
 
 
+_PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1 = object()
+
+
 def _digest(name: str, value: object) -> str:
     if (
         not isinstance(value, str)
@@ -123,12 +126,13 @@ class MassiveAdaptiveRLPolicyTraceV1:
 
     def semantic_unsigned(self) -> dict[str, object]:
         return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "semantic_receipt_sha256"
+            descriptor.name: getattr(self, descriptor.name)
+            for descriptor in fields(self)
+            if descriptor.name != "semantic_receipt_sha256"
         }
 
     def validate(self) -> None:
+        semantic = self.semantic_unsigned()
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_POLICY_TRACE_V1_SCHEMA
             or isinstance(self.fold_index, bool)
@@ -175,7 +179,7 @@ class MassiveAdaptiveRLPolicyTraceV1:
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(semantic)
         ):
             raise MassiveAdaptiveRLPolicySelectionV1Error(
                 "adaptive RL policy trace differs"
@@ -193,7 +197,7 @@ class MassiveAdaptiveRLPolicyTraceV1:
             self.semantic_receipt_sha256,
         ):
             _digest("adaptive RL policy trace", value)
-        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        assert_no_adaptive_hold_semantics(semantic)
 
 
 def build_massive_adaptive_rl_policy_trace_v1(
@@ -208,6 +212,7 @@ def build_massive_adaptive_rl_policy_trace_v1(
     transitions: Sequence[MassiveAdaptiveRLTransitionV1],
     frozen_targets_replayed: bool,
     evaluation_role: str = "inner_validation",
+    _transition_validation_token: object | None = None,
 ) -> MassiveAdaptiveRLPolicyTraceV1:
     """Derive policy economics only from complete environment transitions."""
 
@@ -235,6 +240,7 @@ def build_massive_adaptive_rl_policy_trace_v1(
         checkpoint_source_data_qualified=(
             checkpoint.development_rl_training_authorized
         ),
+        _transition_validation_token=_transition_validation_token,
     )
 
 
@@ -254,6 +260,7 @@ def build_massive_adaptive_rl_policy_trace_from_identities_v1(
     frozen_targets_replayed: bool,
     evaluation_role: str,
     checkpoint_source_data_qualified: bool,
+    _transition_validation_token: object | None = None,
 ) -> MassiveAdaptiveRLPolicyTraceV1:
     """Derive one economic trace from immutable policy identities and transitions."""
 
@@ -270,8 +277,15 @@ def build_massive_adaptive_rl_policy_trace_from_identities_v1(
         raise MassiveAdaptiveRLPolicySelectionV1Error(
             "adaptive RL policy trace is not one complete authorized episode"
         )
-    for row in rows:
-        row.validate()
+    if _transition_validation_token is None:
+        for row in rows:
+            row.validate()
+    elif (
+        _transition_validation_token is not _PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1
+    ):
+        raise MassiveAdaptiveRLPolicySelectionV1Error(
+            "adaptive RL policy-trace transition-validation token differs"
+        )
     dates = tuple(
         row.economic_step.strategy_execution.decision_session_date for row in rows
     )

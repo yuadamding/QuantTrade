@@ -46,6 +46,8 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
     MassiveAdaptiveRLRuntimeSourcesV1,
+    require_massive_adaptive_rl_runtime_sources_replayed_v1,
+    runtime_source_graph_receipt_after_validation_v1,
 )
 
 
@@ -123,8 +125,8 @@ def _digest(name: str, value: object) -> str:
 def _runtime_witness_receipt(
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
 ) -> str:
-    receipt = (
-        runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+    receipt = runtime_source_graph_receipt_after_validation_v1(
+        runtime_sources.runtime_source_graph_authority
     )
     return _digest("adaptive RL runtime graph witness", receipt)
 
@@ -573,7 +575,7 @@ def build_massive_adaptive_rl_four_fold_fit_inputs_authority_v1(
             "adaptive RL four-fold fit inputs require exact manifest and runtime sources"
         )
     manifest.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     rows = tuple(fold_fit_inputs)
     if any(
         type(row) is not MassiveAdaptiveRLFoldFitInputsAuthorityV1 for row in rows
@@ -638,7 +640,7 @@ def build_massive_adaptive_rl_four_fold_fit_authority_v1(
             "adaptive RL four-fold fit requires exact manifest and runtime sources"
         )
     manifest.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     rows = tuple(fold_fits)
     if type(fit_inputs_authority) is not (
         MassiveAdaptiveRLFourFoldFitInputsAuthorityV1

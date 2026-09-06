@@ -62,6 +62,7 @@ from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
 )
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
+    _PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     build_massive_adaptive_rl_policy_trace_from_identities_v1,
 )
 from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
@@ -550,6 +551,7 @@ def _run_action(
         frozen_targets_replayed=False,
         evaluation_role="training_control",
         checkpoint_source_data_qualified=source_inputs_qualified,
+        _transition_validation_token=_PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     )
 
 

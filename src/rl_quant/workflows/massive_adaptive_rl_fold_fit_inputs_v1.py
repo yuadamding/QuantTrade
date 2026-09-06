@@ -41,6 +41,8 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
     MassiveAdaptiveRLRuntimeSourcesV1,
+    require_massive_adaptive_rl_runtime_sources_replayed_v1,
+    runtime_source_graph_receipt_after_validation_v1,
 )
 
 
@@ -227,11 +229,15 @@ class MassiveAdaptiveRLFoldFitInputsAuthorityV1:
             assert self._manifest is not None
             assert self._runtime_sources is not None
             self._manifest.validate()
-            self._runtime_sources.validate()
+            require_massive_adaptive_rl_runtime_sources_replayed_v1(
+                self._runtime_sources
+            )
         runtime_receipt = (
             None
             if self._runtime_sources is None
-            else self._runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+            else runtime_source_graph_receipt_after_validation_v1(
+                self._runtime_sources.runtime_source_graph_authority
+            )
         )
         expected_qualified = bool(
             runtime_present
@@ -324,7 +330,7 @@ def build_massive_adaptive_rl_fold_fit_inputs_authority_v1(
     outer_fold_index: int,
 ) -> MassiveAdaptiveRLFoldFitInputsAuthorityV1:
     manifest.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     execution_environment_authority.validate()
     if (
         outer_fold_index not in manifest.base_manifest.fold_indices
@@ -356,8 +362,8 @@ def build_massive_adaptive_rl_fold_fit_inputs_authority_v1(
         runtime_sources=runtime_sources,
         training_forecast_authority=training,
     )
-    runtime_receipt = (
-        runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+    runtime_receipt = runtime_source_graph_receipt_after_validation_v1(
+        runtime_sources.runtime_source_graph_authority
     )
     if runtime_receipt is None:
         raise MassiveAdaptiveRLFoldFitInputsV1Error(

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
     MassiveAdaptiveProfitabilityEnvV1,
+    _PREVALIDATED_PROFITABILITY_ENV_SOURCE_ROOTS_V1,
 )
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
@@ -35,9 +36,14 @@ from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
 from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     MassiveAdaptiveRLExperimentManifestV3,
 )
+from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 import (
+    runtime_source_graph_inventory_after_validation_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
     MassiveAdaptiveRLFitBlockRuntimeSourcesV1,
     MassiveAdaptiveRLRuntimeSourcesV1,
+    require_massive_adaptive_rl_runtime_sources_replayed_v1,
+    runtime_source_graph_receipt_after_validation_v1,
 )
 
 
@@ -91,15 +97,6 @@ def _authority_receipt(value: object) -> str:
     )
 
 
-def _graph_runtime_authority(
-    *, runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1, role: str
-) -> object:
-    return runtime_sources.runtime_source_graph_authority.runtime_authority(
-        role=role,
-        fold_index=None,
-    )
-
-
 def _validate_global_runtime_roots(
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
 ) -> None:
@@ -112,8 +109,28 @@ def _validate_global_runtime_roots(
         "fill-source-authority": runtime_sources.fill_source,
         "split-plan": runtime_sources.split_plan,
     }
+    graph = runtime_sources.runtime_source_graph_authority
+    inventory = getattr(graph, "runtime_authority_inventory", None)
+    unchecked_inventory = getattr(
+        graph, "_runtime_authority_inventory_unchecked", None
+    )
+    witnessed_by_role = (
+        {
+            row.role: row.authority
+            for row in (
+                runtime_source_graph_inventory_after_validation_v1(graph) or ()
+            )
+            if row.fold_index is None
+        }
+        if callable(inventory) or callable(unchecked_inventory)
+        else None
+    )
     for role, value in expected.items():
-        witnessed = _graph_runtime_authority(runtime_sources=runtime_sources, role=role)
+        witnessed = (
+            graph.runtime_authority(role=role, fold_index=None)
+            if witnessed_by_role is None
+            else witnessed_by_role.get(role)
+        )
         if type(witnessed) is not type(value) or _authority_receipt(
             witnessed
         ) != _authority_receipt(value):
@@ -186,6 +203,9 @@ def _environment_from_block(
             manifest.base_manifest.primary_cost_basis_points
         ),
         maximum_fill_participation=(manifest.base_manifest.maximum_fill_participation),
+        _source_validation_token=(
+            _PREVALIDATED_PROFITABILITY_ENV_SOURCE_ROOTS_V1
+        ),
     )
 
 
@@ -196,8 +216,8 @@ def _environment_authority(
     block: MassiveAdaptiveRLFitBlockRuntimeSourcesV1,
     environment: MassiveAdaptiveProfitabilityEnvV1,
 ) -> MassiveAdaptiveRLFitEnvironmentAuthorityV1:
-    runtime_receipt = (
-        runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+    runtime_receipt = runtime_source_graph_receipt_after_validation_v1(
+        runtime_sources.runtime_source_graph_authority
     )
     if runtime_receipt is None:
         raise MassiveAdaptiveRLFitEnvironmentRegistryV1Error(
@@ -373,7 +393,9 @@ class MassiveAdaptiveRLFitEnvironmentRegistryV1:
             assert self._manifest is not None
             assert self._runtime_sources is not None
             self._manifest.validate()
-            self._runtime_sources.validate()
+            require_massive_adaptive_rl_runtime_sources_replayed_v1(
+                self._runtime_sources
+            )
         expected_qualified = bool(
             runtime_present
             and self.environment_authorities
@@ -439,7 +461,9 @@ class MassiveAdaptiveRLFitEnvironmentRegistryV1:
         if runtime_present:
             assert self._manifest is not None
             assert self._runtime_sources is not None
-            runtime_receipt = self._runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+            runtime_receipt = runtime_source_graph_receipt_after_validation_v1(
+                self._runtime_sources.runtime_source_graph_authority
+            )
             if (
                 self._manifest.experiment_id != self.experiment_id
                 or self._manifest.semantic_receipt_sha256
@@ -523,7 +547,7 @@ def build_massive_adaptive_rl_fit_environment_registry_v1(
     """Build all causal fit environments from one witnessed source graph."""
 
     manifest.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     if (
         type(runtime_sources) is not MassiveAdaptiveRLRuntimeSourcesV1
         or outer_fold_index not in manifest.base_manifest.fold_indices
@@ -536,8 +560,8 @@ def build_massive_adaptive_rl_fit_environment_registry_v1(
             "adaptive RL fit environment manifest or runtime sources differ"
         )
     _validate_global_runtime_roots(runtime_sources)
-    runtime_receipt = (
-        runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+    runtime_receipt = runtime_source_graph_receipt_after_validation_v1(
+        runtime_sources.runtime_source_graph_authority
     )
     if runtime_receipt is None:
         raise MassiveAdaptiveRLFitEnvironmentRegistryV1Error(

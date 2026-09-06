@@ -214,8 +214,20 @@ class MassiveAdaptiveFillSourceV1:
             raise MassiveAdaptiveFillSourceV1Error("adaptive fill audit receipt differs")
 
     def row(self, *, session_date: str, security_id: str) -> MassiveAdaptiveFillRowV1:
-        for row in self.rows:
-            if row.session_date == session_date and row.security_id == security_id:
+        target = (session_date, security_id)
+        lower = 0
+        upper = len(self.rows)
+        while lower < upper:
+            middle = (lower + upper) // 2
+            row = self.rows[middle]
+            key = (row.session_date, row.security_id)
+            if key < target:
+                lower = middle + 1
+            else:
+                upper = middle
+        if lower < len(self.rows):
+            row = self.rows[lower]
+            if (row.session_date, row.security_id) == target:
                 return row
         raise MassiveAdaptiveFillSourceV1Error("fill row is outside adaptive support")
 

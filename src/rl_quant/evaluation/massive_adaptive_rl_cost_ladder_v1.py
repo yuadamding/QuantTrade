@@ -30,6 +30,7 @@ from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
 )
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
+    _PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     build_massive_adaptive_rl_policy_trace_v1,
 )
 
@@ -188,6 +189,7 @@ def _replay_frozen_targets(
         transitions=transitions,
         frozen_targets_replayed=True,
         evaluation_role=primary.evaluation_role,
+        _transition_validation_token=_PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     )
     return trace, transitions
 

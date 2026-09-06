@@ -13,9 +13,9 @@ evaluation target.
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
 
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 
@@ -243,6 +243,8 @@ def _positive_int(name: str, value: object) -> int:
 def assert_no_adaptive_hold_semantics(value: object, *, path: str = "root") -> None:
     """Reject duration-prior fields from adaptive configuration objects."""
 
+    if value is None or type(value) in {bool, int, float, complex}:
+        return
     if is_dataclass(value) and not isinstance(value, type):
         for field in fields(value):
             if field.name in FORBIDDEN_ADAPTIVE_CONFIGURATION_FIELDS:

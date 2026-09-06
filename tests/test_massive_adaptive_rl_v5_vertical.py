@@ -72,6 +72,9 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
 from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
     MASSIVE_ADAPTIVE_RL_PREQUENTIAL_STAGE_ORDER_V1,
 )
+from massive_adaptive_rl_v5_persisted_fixture import (
+    run_persisted_v5_qualification,
+)
 
 
 _SESSION_COUNT = 126
@@ -1051,7 +1054,9 @@ def test_full_cold_replay_is_nonmaterializing(tmp_path: Path, real_vertical) -> 
     assert tuple(row.fold_index for row in replayed) == (0, 1, 2, 3)
 
 
-def test_real_v5_vertical_executes_without_economic_mocks(real_vertical) -> None:
+def test_real_v5_vertical_executes_without_economic_mocks(
+    tmp_path: Path, real_vertical
+) -> None:
     assert tuple(row.fold_index for row in real_vertical) == (0, 1, 2, 3)
     assert all(row.model_updated for row in real_vertical)
     assert len({row.checkpoint_receipt for row in real_vertical}) == 4
@@ -1059,21 +1064,31 @@ def test_real_v5_vertical_executes_without_economic_mocks(real_vertical) -> None
         len(row.computation.ppo_primary_transitions) == _SESSION_COUNT
         for row in real_vertical
     )
-    assert all(
+    ppo_traded_notionals = tuple(
         sum(
             transition.economic_step.strategy_execution.gross_traded_notional
             for transition in row.computation.ppo_primary_transitions
         )
-        > 0.0
         for row in real_vertical
     )
-    assert all(
+    # A trained stochastic fixture may legitimately choose CASH in one fold;
+    # V5 must preserve that negative economic result.  The four-fold smoke
+    # still requires the learned path to exercise real fills somewhere.
+    assert any(value > 0.0 for value in ppo_traded_notionals), ppo_traded_notionals
+    ppo_transaction_costs = tuple(
         sum(
             transition.economic_step.strategy_execution.total_transaction_cost
             for transition in row.computation.ppo_primary_transitions
         )
-        > 0.0
         for row in real_vertical
+    )
+    assert all(
+        (notional > 0.0) == (cost > 0.0)
+        for notional, cost in zip(
+            ppo_traded_notionals,
+            ppo_transaction_costs,
+            strict=True,
+        )
     )
     assert all(
         sum(
@@ -1086,3 +1101,13 @@ def test_real_v5_vertical_executes_without_economic_mocks(real_vertical) -> None
     assert tuple(
         stage.value for stage in MASSIVE_ADAPTIVE_RL_PREQUENTIAL_STAGE_ORDER_V1
     ) == (MASSIVE_ADAPTIVE_RL_PREQUENTIAL_STAGE_SEQUENCE_V1)
+    persisted = run_persisted_v5_qualification(tmp_path / "persisted-v5")
+    assert persisted.first_run.next_required_stage == (
+        "execution-implementation-registration"
+    )
+    for result in (persisted.completed_run, persisted.verified_run):
+        assert result.sealed_outer_fold_indices == (0, 1, 2, 3)
+        assert result.prequential_state_head_stage == "full-cold-replay-verified"
+        assert result.full_cold_replay_verified is True
+        assert result.end_to_end_profitability_execution_complete is True
+        assert result.positive_profitability_authorization_eligible is False

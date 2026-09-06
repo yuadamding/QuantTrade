@@ -23,6 +23,8 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
     MassiveAdaptiveRLRuntimeSourcesV1,
+    require_massive_adaptive_rl_runtime_sources_replayed_v1,
+    runtime_source_graph_receipt_after_validation_v1,
 )
 
 
@@ -161,7 +163,9 @@ class MassiveAdaptiveRLFoldFitChronologyAuthorityV1:
             assert self._runtime_sources is not None
             assert self._training_forecast_authority is not None
             self._manifest.validate()
-            self._runtime_sources.validate()
+            require_massive_adaptive_rl_runtime_sources_replayed_v1(
+                self._runtime_sources
+            )
             self._training_forecast_authority.validate()
             manifest = self._manifest
             runtime_sources = self._runtime_sources
@@ -173,7 +177,9 @@ class MassiveAdaptiveRLFoldFitChronologyAuthorityV1:
             ]
             expected_validation = split_fold.inner_validation_session_dates
             expected_outer = split_fold.outer_test_session_dates
-            runtime_receipt = runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+            runtime_receipt = runtime_source_graph_receipt_after_validation_v1(
+                runtime_sources.runtime_source_graph_authority
+            )
         else:
             manifest = None
             runtime_sources = None
@@ -288,7 +294,7 @@ def build_massive_adaptive_rl_fold_fit_chronology_authority_v1(
     """Commit all date roles while authorizing only the causal fit prefix."""
 
     manifest.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     training_forecast_authority.validate()
     fold_index = training_forecast_authority.outer_fold_index
     if (
@@ -302,7 +308,9 @@ def build_massive_adaptive_rl_fold_fit_chronology_authority_v1(
         raise MassiveAdaptiveRLFoldFitChronologyAuthorityV1Error(
             "adaptive RL fold-fit chronology inputs differ"
         )
-    runtime_receipt = runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+    runtime_receipt = runtime_source_graph_receipt_after_validation_v1(
+        runtime_sources.runtime_source_graph_authority
+    )
     if runtime_receipt is None:
         raise MassiveAdaptiveRLFoldFitChronologyAuthorityV1Error(
             "adaptive RL fold-fit runtime graph witness is absent"

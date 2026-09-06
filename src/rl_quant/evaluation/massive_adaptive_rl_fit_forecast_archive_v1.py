@@ -9,7 +9,7 @@ the compatibility proof and reruns every model output exactly.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from io import BytesIO
 from pathlib import Path
 from typing import cast
@@ -257,7 +257,9 @@ class MassiveAdaptiveRLFitForecastArchiveV1:
             "semantic_receipt_sha256",
         }
         return {
-            key: value for key, value in asdict(self).items() if key not in excluded
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+            if field.name not in excluded
         }
 
     def validate(self) -> None:

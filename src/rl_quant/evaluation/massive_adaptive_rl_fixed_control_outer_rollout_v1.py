@@ -44,6 +44,7 @@ from rl_quant.training.massive_adaptive_rl_fixed_control_selection_v1 import (
 )
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
+    _PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     build_massive_adaptive_rl_policy_trace_from_identities_v1,
 )
 
@@ -375,6 +376,7 @@ def run_massive_adaptive_rl_fixed_control_outer_rollout_v1(
             and chronology_authority.outer_evaluation_authorized
             and outer_plan.outer_evaluation_authorized
         ),
+        _transition_validation_token=_PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     )
     source_qualified = bool(
         outer_plan.outer_evaluation_authorized

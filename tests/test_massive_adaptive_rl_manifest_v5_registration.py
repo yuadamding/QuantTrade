@@ -73,6 +73,7 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     load_massive_adaptive_rl_manifest_v5_registration_authority_v1,
     manifest_v5_registration_relative_path_v1,
     issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1,
+    issue_massive_adaptive_rl_manifest_v5_training_capability_v1,
     reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration,
     run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1,
 )
@@ -501,6 +502,43 @@ def test_writer_capability_replays_registration_and_is_role_scoped(
             request_id="GUARD-TEST",
         )
     assert not (tmp_path / relative).exists()
+
+
+def test_training_capability_authorizes_execution_environment_publication(
+    tmp_path: Path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="registration-training-environment"
+    )
+    registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+        root=tmp_path,
+        manifest=manifest,
+    )
+    capability = issue_massive_adaptive_rl_manifest_v5_training_capability_v1(
+        root=tmp_path,
+        authority=registration,
+    )
+    with massive_adaptive_rl_manifest_v5_writer_scope_v1(
+        root=tmp_path,
+        capability=capability,
+    ):
+        authorize_massive_adaptive_rl_source_publication_v5(
+            root=tmp_path,
+            relative_payload_path=(
+                "massive-adaptive/rl-execution-environment-authority-v1/"
+                "registration-training-environment-fold0.json"
+            ),
+        )
+        with pytest.raises(
+            MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
+            match="does not authorize",
+        ):
+            authorize_massive_adaptive_rl_source_publication_v5(
+                root=tmp_path,
+                relative_payload_path=(
+                    "massive-adaptive/rl-validation-inputs-v1/forbidden.json"
+                ),
+            )
 
 
 def test_writer_capability_binds_separate_source_publication_root(

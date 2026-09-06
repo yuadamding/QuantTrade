@@ -39,6 +39,7 @@ from rl_quant.evaluation.massive_adaptive_outer_access_commitment_v2 import (
 )
 from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
     MassiveAdaptiveProfitabilityEnvV1,
+    _PREVALIDATED_PROFITABILITY_ENV_SOURCE_ROOTS_V1,
 )
 from rl_quant.features.massive_adaptive_decision_root_v1 import (
     MassiveAdaptiveDecisionRootV1,
@@ -80,6 +81,9 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
     issue_massive_adaptive_rl_manifest_v5_prequential_outer_execution_capability_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
+    require_massive_adaptive_rl_runtime_sources_replayed_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     massive_adaptive_rl_manifest_v5_writer_scope_v1,
@@ -746,7 +750,7 @@ def run_or_resume_massive_adaptive_rl_outer_inputs_v1(
     frozen_policy = outer_access.frozen_policy
     initial_inputs = frozen_policy.policy_selection_authority.fold_validation_authority.release_authority.initial_validation_inputs
     runtime_sources = initial_inputs.runtime_sources_v2.base_runtime_sources_v1
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     fold_index = outer_access.fold_index
     lineage = runtime_sources.fold(fold_index).supervised_lineage(fold_index)
     origins = runtime_sources.outer_origin_inputs(fold_index)
@@ -924,6 +928,9 @@ def run_or_resume_massive_adaptive_rl_outer_inputs_v1(
             initial_capital=economics.primary_capital,
             transaction_cost_basis_points=cost,
             maximum_fill_participation=economics.maximum_fill_participation,
+            _source_validation_token=(
+                _PREVALIDATED_PROFITABILITY_ENV_SOURCE_ROOTS_V1
+            ),
         )
         for cost in (*cost_ladder, float(economics.primary_cost_basis_points))
     )

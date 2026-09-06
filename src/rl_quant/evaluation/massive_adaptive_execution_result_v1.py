@@ -40,6 +40,9 @@ class MassiveAdaptiveExecutionResultV1Error(ValueError):
     """Requested, filled, cash, and marked quantities do not reconcile."""
 
 
+_PREVALIDATED_EXECUTION_SOURCE_ROOTS_V1 = object()
+
+
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveExecutionRowV1:
     security_id: str
@@ -111,6 +114,7 @@ class MassiveAdaptiveExecutionResultV1:
         }
 
     def validate(self) -> None:
+        semantic = self.semantic_unsigned()
         if (
             self.schema != MASSIVE_ADAPTIVE_EXECUTION_RESULT_V1_SCHEMA
             or not self.decision_session_date
@@ -133,7 +137,7 @@ class MassiveAdaptiveExecutionResultV1:
             or not isinstance(self.economic_event_transition_qualified, bool)
             or self.economic_event_transition_qualified
             != (self.event_transition_receipt_sha256 is not None)
-            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(semantic)
         ):
             raise MassiveAdaptiveExecutionResultV1Error(
                 "adaptive execution result differs"
@@ -141,7 +145,7 @@ class MassiveAdaptiveExecutionResultV1:
         for row in self.rows:
             row.validate()
         self.posttrade_book.validate()
-        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        assert_no_adaptive_hold_semantics(semantic)
 
 
 def execute_massive_adaptive_order_intent_v1(
@@ -154,14 +158,20 @@ def execute_massive_adaptive_order_intent_v1(
     economic_event_transition: MassiveAdaptiveEconomicEventTransitionV1 | None = None,
     transaction_cost_basis_points: float = 20.0,
     maximum_fill_participation: float = 0.02,
+    _source_validation_token: object | None = None,
 ) -> MassiveAdaptiveExecutionResultV1:
     """Fill one pending intent, charge costs, and mark the resulting book."""
 
     order_intent.validate()
     book.validate()
-    fill_source.validate()
-    daily_input_authority.validate()
-    identity_authority.validate()
+    if _source_validation_token is None:
+        fill_source.validate()
+        daily_input_authority.validate()
+        identity_authority.validate()
+    elif _source_validation_token is not _PREVALIDATED_EXECUTION_SOURCE_ROOTS_V1:
+        raise MassiveAdaptiveExecutionResultV1Error(
+            "execution source-validation token differs"
+        )
     if economic_event_transition is not None:
         economic_event_transition.validate()
     if (

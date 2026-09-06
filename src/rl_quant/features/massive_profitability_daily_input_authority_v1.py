@@ -649,11 +649,43 @@ class MassiveProfitabilityDailyInputAuthorityV1:
             )
 
     def row(self, *, session_date: str, security_id: str) -> MassiveProfitabilityDailySecurityInputV1:
-        for value in self.rows:
-            if value.source_session_date == session_date and value.security_id == security_id:
+        target = (session_date, security_id)
+        lower = 0
+        upper = len(self.rows)
+        while lower < upper:
+            middle = (lower + upper) // 2
+            value = self.rows[middle]
+            key = (value.source_session_date, value.security_id)
+            if key < target:
+                lower = middle + 1
+            else:
+                upper = middle
+        if lower < len(self.rows):
+            value = self.rows[lower]
+            if (value.source_session_date, value.security_id) == target:
                 return value
         raise MassiveProfitabilityDailyInputAuthorityV1Error(
             "requested daily input row is outside the frozen rectangle"
+        )
+
+    def session(self, *, session_date: str) -> MassiveProfitabilityDailyInputSessionV1:
+        """Return one already validated session from the canonical date inventory."""
+
+        lower = 0
+        upper = len(self.sessions)
+        while lower < upper:
+            middle = (lower + upper) // 2
+            value = self.sessions[middle]
+            if value.source_session_date < session_date:
+                lower = middle + 1
+            else:
+                upper = middle
+        if lower < len(self.sessions):
+            value = self.sessions[lower]
+            if value.source_session_date == session_date:
+                return value
+        raise MassiveProfitabilityDailyInputAuthorityV1Error(
+            "requested daily input session is outside the frozen rectangle"
         )
 
 

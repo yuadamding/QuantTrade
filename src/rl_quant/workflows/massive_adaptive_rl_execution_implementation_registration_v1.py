@@ -583,7 +583,11 @@ def massive_adaptive_rl_preimplementation_economic_evidence_v1(
 def _training_lineage_v1(
     *, root: str | Path, manifest: MassiveAdaptiveRLExperimentManifestV5
 ) -> tuple[str, str]:
-    """Derive the exact completed training state and four-fold fit receipts."""
+    """Bind training lineage, not V2's terminal-report qualification flag.
+
+    A nonterminal V2 state is never source_data_qualified. Validation access
+    separately requires exact replay of the bound four-fold fit authority.
+    """
 
     states = load_massive_adaptive_rl_experiment_states_v2(
         artifact_root=root,
@@ -599,7 +603,6 @@ def _training_lineage_v1(
         len(matches) != 1
         or matches[0].manifest_receipt_sha256
         != manifest.base_manifest.base_manifest.semantic_receipt_sha256
-        or not matches[0].source_data_qualified
         or not matches[0].stage_artifact_receipt_sha256
     ):
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(

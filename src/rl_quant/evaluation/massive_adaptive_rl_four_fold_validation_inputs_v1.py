@@ -50,6 +50,7 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
     MassiveAdaptiveRLRuntimeSourcesV1,
+    require_massive_adaptive_rl_runtime_sources_replayed_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     legacy_manifest_v5_rejecting_writer_guard_v1,
@@ -460,7 +461,7 @@ def build_massive_adaptive_rl_four_fold_validation_inputs_authority_v1(
         )
     manifest.validate()
     four_fold_fit_authority.validate()
-    runtime_sources.validate()
+    require_massive_adaptive_rl_runtime_sources_replayed_v1(runtime_sources)
     sources = tuple(validation_sources)
     registries = tuple(validation_environment_registries)
     if (

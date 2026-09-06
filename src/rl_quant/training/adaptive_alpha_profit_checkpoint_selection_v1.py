@@ -46,6 +46,7 @@ MASSIVE_ADAPTIVE_PROFIT_CHECKPOINT_SELECTION_V1_RULE = (
 _BUCKET_IDS = tuple(row.bucket_id for row in MASSIVE_ADAPTIVE_ALPHA_V1_BUCKETS)
 _SETTING_IDS = frozenset(row.setting_id for row in MASSIVE_ADAPTIVE_ALPHA_V1_SETTINGS)
 _HEX = frozenset(string.hexdigits.lower())
+_FROZEN_ADAPTIVE_ALPHA_PROTOCOL_V1 = MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL
 
 
 class MassiveAdaptiveProfitCheckpointSelectionError(ValueError):
@@ -410,8 +411,7 @@ class MassiveAdaptiveProfitValidationTraceV1:
             raise MassiveAdaptiveProfitCheckpointSelectionError(
                 "validation trace does not bind the adaptive-alpha protocol"
             )
-        MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL.validate()
-        if MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL.receipt_sha256 != self.protocol_receipt_sha256:
+        if MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL is not _FROZEN_ADAPTIVE_ALPHA_PROTOCOL_V1:
             raise MassiveAdaptiveProfitCheckpointSelectionError(
                 "adaptive-alpha protocol root drifted"
             )

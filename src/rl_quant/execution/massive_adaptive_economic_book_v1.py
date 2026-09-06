@@ -121,6 +121,7 @@ class MassiveAdaptiveEconomicBookV1:
         }
 
     def validate(self) -> None:
+        semantic = self.semantic_unsigned()
         cash = _finite("cash", self.cash, nonnegative=True)
         equity = _finite("marked equity", self.marked_equity, nonnegative=True)
         high_water = _finite("high-water mark", self.high_water_mark, nonnegative=True)
@@ -150,9 +151,9 @@ class MassiveAdaptiveEconomicBookV1:
             "semantic_receipt_sha256",
         ):
             _digest(name, getattr(self, name))
-        if self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned()):
+        if self.semantic_receipt_sha256 != semantic_sha256(semantic):
             raise MassiveAdaptiveEconomicBookV1Error("economic book receipt differs")
-        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        assert_no_adaptive_hold_semantics(semantic)
 
     def shares_by_security(self) -> dict[str, float]:
         self.validate()

@@ -38,6 +38,7 @@ from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
 )
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
+    _PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
     build_massive_adaptive_rl_policy_trace_from_identities_v1,
 )
 
@@ -272,6 +273,7 @@ def evaluate_massive_adaptive_rl_fixed_control_outer_cost_ladder_v1(
             frozen_targets_replayed=True,
             evaluation_role="outer_test",
             checkpoint_source_data_qualified=primary.source_data_qualified,
+            _transition_validation_token=_PREVALIDATED_POLICY_TRACE_TRANSITIONS_V1,
         )
 
     low_trace = trace(low_cost_environment, low_transitions)

@@ -17,14 +17,17 @@ from rl_quant.evaluation.massive_adaptive_benchmark_authority_v1 import (
 )
 from rl_quant.evaluation.massive_adaptive_compiler_input_authority_v2 import (
     MassiveAdaptiveCompilerInputAuthorityV2,
+    _PREVALIDATED_COMPILER_SOURCE_ROOTS_V2,
     build_massive_adaptive_compiler_input_authority_v2,
 )
 from rl_quant.evaluation.massive_adaptive_economic_event_transition_v2 import (
     MassiveAdaptiveEconomicEventTransitionV2,
+    _PREVALIDATED_EVENT_SOURCE_ROOTS_V2,
     build_massive_adaptive_economic_event_transition_v2,
 )
 from rl_quant.evaluation.massive_adaptive_execution_result_v1 import (
     MassiveAdaptiveExecutionResultV1,
+    _PREVALIDATED_EXECUTION_SOURCE_ROOTS_V1,
     execute_massive_adaptive_order_intent_v1,
 )
 from rl_quant.evaluation.massive_adaptive_forecast_archive_v2 import (
@@ -94,6 +97,11 @@ class MassiveAdaptiveEconomicStepV1Error(ValueError):
     """The prepared roots, decisions, execution, or wealth do not reconcile."""
 
 
+_PREVALIDATED_ECONOMIC_SOURCE_ROOTS_V1 = object()
+_DEFER_ECONOMIC_STEP_RESULT_VALIDATION_V1 = object()
+_PREVALIDATED_PREPARATION_SOURCE_ROOTS_V1 = object()
+
+
 def _digest(value: str | None, *, optional: bool = False) -> None:
     if optional and value is None:
         return
@@ -148,6 +156,7 @@ class MassiveAdaptivePreparedStepV1:
         }
 
     def validate(self) -> None:
+        semantic = self.semantic_unsigned()
         for value in (
             self.strategy_compiler_input_authority,
             self.neutral_compiler_input_authority,
@@ -176,7 +185,7 @@ class MassiveAdaptivePreparedStepV1:
             or self.benchmark_authority.benchmark_book_receipt_sha256
             != self.benchmark_pretrade_book.semantic_receipt_sha256
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(semantic)
         ):
             raise MassiveAdaptiveEconomicStepV1Error(
                 "prepared adaptive economic step differs"
@@ -188,7 +197,7 @@ class MassiveAdaptivePreparedStepV1:
             self.semantic_receipt_sha256,
         ):
             _digest(receipt)
-        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        assert_no_adaptive_hold_semantics(semantic)
 
 
 def prepare_massive_adaptive_economic_step_v1(
@@ -204,9 +213,22 @@ def prepare_massive_adaptive_economic_step_v1(
     benchmark_book: MassiveAdaptiveEconomicBookV1,
     daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
     identity_authority: PITSecurityUniverseAuthority,
+    _source_validation_token: object | None = None,
 ) -> MassiveAdaptivePreparedStepV1:
     """Build causal compiler inputs for strategy and neutral shadow books."""
 
+    if _source_validation_token is None:
+        for value in (
+            forecast_archive,
+            calibration,
+            daily_input_authority,
+            identity_authority,
+        ):
+            value.validate()
+    elif _source_validation_token is not _PREVALIDATED_PREPARATION_SOURCE_ROOTS_V1:
+        raise MassiveAdaptiveEconomicStepV1Error(
+            "economic-step preparation source-validation token differs"
+        )
     for value in (strategy_book, neutral_book, benchmark_book):
         value.validate()
         if value.decision_session_date != inference_row.decision_session_date:
@@ -245,6 +267,7 @@ def prepare_massive_adaptive_economic_step_v1(
         book=strategy_book,
         daily_input_authority=daily_input_authority,
         identity_authority=identity_authority,
+        _source_validation_token=_PREVALIDATED_COMPILER_SOURCE_ROOTS_V2,
     )
     neutral_authority = build_massive_adaptive_compiler_input_authority_v2(
         forecast_archive=forecast_archive,
@@ -257,6 +280,7 @@ def prepare_massive_adaptive_economic_step_v1(
         book=neutral_book,
         daily_input_authority=daily_input_authority,
         identity_authority=identity_authority,
+        _source_validation_token=_PREVALIDATED_COMPILER_SOURCE_ROOTS_V2,
     )
     source_inventory = semantic_sha256(
         (
@@ -364,6 +388,7 @@ def _execute_decision(
         economic_event_transition=transition,  # type: ignore[arg-type]
         transaction_cost_basis_points=transaction_cost_basis_points,
         maximum_fill_participation=maximum_fill_participation,
+        _source_validation_token=_PREVALIDATED_EXECUTION_SOURCE_ROOTS_V1,
     )
 
 
@@ -421,6 +446,7 @@ def _execute_frozen_target(
         economic_event_transition=transition,  # type: ignore[arg-type]
         transaction_cost_basis_points=transaction_cost_basis_points,
         maximum_fill_participation=maximum_fill_participation,
+        _source_validation_token=_PREVALIDATED_EXECUTION_SOURCE_ROOTS_V1,
     )
 
 
@@ -466,6 +492,7 @@ class MassiveAdaptiveEconomicStepV1:
         }
 
     def validate(self) -> None:
+        semantic = self.semantic_unsigned()
         for value in (
             self.strategy_execution,
             self.neutral_execution,
@@ -519,7 +546,7 @@ class MassiveAdaptiveEconomicStepV1:
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_ECONOMIC_STEP_V1_SPEC_SHA256
-            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(semantic)
         ):
             raise MassiveAdaptiveEconomicStepV1Error(
                 "settled adaptive economic step differs"
@@ -547,7 +574,7 @@ class MassiveAdaptiveEconomicStepV1:
             raise MassiveAdaptiveEconomicStepV1Error(
                 "neutral policy did not reproduce the deterministic economic path"
             )
-        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        assert_no_adaptive_hold_semantics(semantic)
 
 
 def settle_massive_adaptive_economic_step_v1(
@@ -565,12 +592,24 @@ def settle_massive_adaptive_economic_step_v1(
     policy_control_receipt_sha256: str | None = None,
     policy_control: MassiveAdaptiveRLCompilerControlV1 | None = None,
     frozen_targets_replayed: bool = False,
+    _source_validation_token: object | None = None,
+    _result_validation_token: object | None = None,
 ) -> MassiveAdaptiveEconomicStepV1:
     """Settle strategy, neutral, and benchmark through one source chronology."""
 
     prepared.validate()
     policy_decision.validate()
     neutral_decision.validate()
+    if _source_validation_token is None:
+        fill_source.validate()
+        daily_input_authority.validate()
+        identity_authority.validate()
+        if economic_event_archive is not None:
+            economic_event_archive.validate()
+    elif _source_validation_token is not _PREVALIDATED_ECONOMIC_SOURCE_ROOTS_V1:
+        raise MassiveAdaptiveEconomicStepV1Error(
+            "economic-step source-validation token differs"
+        )
     if not isinstance(frozen_targets_replayed, bool):
         raise MassiveAdaptiveEconomicStepV1Error("frozen-target replay flag is invalid")
     if policy_control is not None:
@@ -611,6 +650,7 @@ def settle_massive_adaptive_economic_step_v1(
             provider_archive=economic_event_archive,
             daily_input_authority=daily_input_authority,
             identity_authority=identity_authority,
+            _source_validation_token=_PREVALIDATED_EVENT_SOURCE_ROOTS_V2,
         )
     )
     strategy_execution = (
@@ -684,6 +724,7 @@ def settle_massive_adaptive_economic_step_v1(
         economic_event_transition=transition,  # type: ignore[arg-type]
         transaction_cost_basis_points=transaction_cost_basis_points,
         maximum_fill_participation=maximum_fill_participation,
+        _source_validation_token=_PREVALIDATED_EXECUTION_SOURCE_ROOTS_V1,
     )
     strategy_log = math.log(
         strategy_execution.posttrade_book.marked_equity
@@ -769,7 +810,12 @@ def settle_massive_adaptive_economic_step_v1(
         provisional,
         semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
     )
-    result.validate()
+    if _result_validation_token is None:
+        result.validate()
+    elif _result_validation_token is not _DEFER_ECONOMIC_STEP_RESULT_VALIDATION_V1:
+        raise MassiveAdaptiveEconomicStepV1Error(
+            "economic-step result-validation token differs"
+        )
     return result
 
 

@@ -70,6 +70,9 @@ class MassiveAdaptiveCompilerInputAuthorityV2Error(ValueError):
     """Compiler inputs are detached from forecast/calibration/benchmark roots."""
 
 
+_PREVALIDATED_COMPILER_SOURCE_ROOTS_V2 = object()
+
+
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveCompilerInputAuthorityV2:
     decision_session_date: str
@@ -210,19 +213,28 @@ def build_massive_adaptive_compiler_input_authority_v2(
     book: MassiveAdaptiveEconomicBookV1,
     daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
     identity_authority: PITSecurityUniverseAuthority,
+    _source_validation_token: object | None = None,
 ) -> MassiveAdaptiveCompilerInputAuthorityV2:
     """Derive one compiler input with no free benchmark or calibration arrays."""
 
+    if _source_validation_token is None:
+        for value in (
+            forecast_archive,
+            calibration,
+            daily_input_authority,
+            identity_authority,
+        ):
+            value.validate()
+    elif _source_validation_token is not _PREVALIDATED_COMPILER_SOURCE_ROOTS_V2:
+        raise MassiveAdaptiveCompilerInputAuthorityV2Error(
+            "compiler source-validation token differs"
+        )
     for value in (
-        forecast_archive,
         forecast_row,
-        calibration,
         benchmark_authority,
         decision_root,
         context_origin,
         book,
-        daily_input_authority,
-        identity_authority,
     ):
         value.validate()
     inference_row.validate(
