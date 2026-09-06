@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 import pytest
 
@@ -26,6 +30,11 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
 )
 from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_scope_v1 import (
     massive_adaptive_rl_vertical_qualification_scope_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_runner_v1 import (
+    MASSIVE_ADAPTIVE_RL_FRESH_REPLAY_TIMEOUT_SECONDS_V1,
+    MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_TIMEOUT_SECONDS_V1,
+    _run_vertical_qualification_process_v1,
 )
 
 
@@ -437,6 +446,9 @@ def test_vertical_qualification_receipt_redacts_duration_and_disables_caches(
         assert command[4:6] == ("-p", "no:cacheprovider")
         assert command[6:] == implementation._VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS
         assert kwargs["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+        assert kwargs["timeout"] == (
+            MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_TIMEOUT_SECONDS_V1
+        )
         return implementation.subprocess.CompletedProcess(
             command,
             returncode=0,
@@ -444,7 +456,7 @@ def test_vertical_qualification_receipt_redacts_duration_and_disables_caches(
             stderr=b"",
         )
 
-    monkeypatch.setattr(implementation.subprocess, "run", completed)
+    monkeypatch.setattr(implementation, "_run_vertical_qualification_process_v1", completed)
     first = implementation._vertical_qualification(
         repository_root=tmp_path,
         v5_native_vertical_complete=True,
@@ -497,8 +509,8 @@ def test_registered_qualification_replay_does_not_launch_pytest(
     )
     authority = SimpleNamespace(**qualification)
     monkeypatch.setattr(
-        implementation.subprocess,
-        "run",
+        implementation,
+        "_run_vertical_qualification_process_v1",
         lambda *_, **__: (_ for _ in ()).throw(AssertionError("pytest reran")),
     )
 
@@ -526,7 +538,7 @@ def test_vertical_qualification_rejects_skipped_required_node(
             stderr=b"",
         )
 
-    monkeypatch.setattr(implementation.subprocess, "run", completed)
+    monkeypatch.setattr(implementation, "_run_vertical_qualification_process_v1", completed)
     result = implementation._vertical_qualification(
         repository_root=tmp_path,
         v5_native_vertical_complete=True,
@@ -535,3 +547,111 @@ def test_vertical_qualification_rejects_skipped_required_node(
     assert result["vertical_qualification_passed"] is False
     assert result["vertical_qualification_passed_node_count"] == 11
     assert result["vertical_qualification_nonpass_outcome_labels"] == ("skipped",)
+
+
+def test_qualification_budget_contains_training_and_fresh_replay() -> None:
+    assert MASSIVE_ADAPTIVE_RL_FRESH_REPLAY_TIMEOUT_SECONDS_V1 == 2 * 60 * 60
+    assert MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_TIMEOUT_SECONDS_V1 == 6 * 60 * 60
+    # Training alone has exceeded an hour; leave four hours outside the nested
+    # verifier for setup, training, economics, and in-process reconstruction.
+    assert (
+        MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_TIMEOUT_SECONDS_V1
+        - MASSIVE_ADAPTIVE_RL_FRESH_REPLAY_TIMEOUT_SECONDS_V1
+    ) == 4 * 60 * 60
+
+
+def test_qualification_timeout_is_not_a_failed_profitability_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    test_path = tmp_path / "tests" / "test_massive_adaptive_rl_v5_vertical.py"
+    test_path.parent.mkdir()
+    test_path.write_text("# Test inventory only; no economic qualification.\n")
+    before = tuple(tmp_path.rglob("*"))
+
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=b"partial")
+
+    monkeypatch.setattr(implementation, "_run_vertical_qualification_process_v1", timeout)
+    with pytest.raises(
+        MassiveAdaptiveRLExecutionImplementationRegistrationV1Error,
+        match="timed out after 21600s; operational failure, not an economic result",
+    ) as raised:
+        implementation._vertical_qualification(
+            repository_root=tmp_path, v5_native_vertical_complete=True
+        )
+
+    assert isinstance(raised.value.__cause__, subprocess.TimeoutExpired)
+    assert tuple(tmp_path.rglob("*")) == before
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "elapsed_seconds=" in output.err
+    assert "timeout_seconds=21600" in output.err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="qualification uses POSIX isolation")
+def test_qualification_process_preserves_output_and_nonzero_exit(tmp_path: Path) -> None:
+    result = _run_vertical_qualification_process_v1(
+        (
+            sys.executable,
+            "-c",
+            "import sys; print('stdout'); print('stderr', file=sys.stderr); sys.exit(3)",
+        ),
+        cwd=tmp_path,
+        env=dict(os.environ),
+        timeout=10,
+    )
+    assert result.returncode == 3
+    assert result.stdout == b"stdout\n"
+    assert result.stderr == b"stderr\n"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="inspects owned Linux child state")
+@pytest.mark.parametrize("leader_exits", (False, True))
+def test_qualification_timeout_stops_descendants_even_after_leader_exit(
+    tmp_path: Path, leader_exits: bool
+) -> None:
+    # This is a real process tree, not a mocked timeout. The child deliberately
+    # ignores TERM and holds the output pipes. Killing only the leader leaks it.
+    code = """
+import os
+import signal
+import sys
+import time
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    print('descendant=' + str(os.getpid()), flush=True)
+    time.sleep(60)
+    os._exit(0)
+if sys.argv[1] == 'True':
+    os._exit(0)
+os.waitpid(child, 0)
+"""
+    started_at = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        _run_vertical_qualification_process_v1(
+            (sys.executable, "-c", code, str(leader_exits)),
+            cwd=tmp_path,
+            env=dict(os.environ),
+            timeout=2,
+        )
+    assert time.monotonic() - started_at < 10
+    output = raised.value.output
+    assert isinstance(output, bytes)
+    descendant_pid = int(output.decode("ascii").strip().removeprefix("descendant="))
+    # init may not have reaped the orphan yet; a zombie cannot keep computing
+    # or writing evidence. Inspect only this test-owned PID, never other jobs.
+    state_path = Path(f"/proc/{descendant_pid}/stat")
+    deadline = time.monotonic() + 2
+    while state_path.exists():
+        try:
+            state = state_path.read_text().split(")", 1)[1].split()[0]
+        except FileNotFoundError:
+            break
+        if state == "Z":
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("qualification left its descendant running after timeout")
+        time.sleep(0.01)

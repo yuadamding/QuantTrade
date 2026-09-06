@@ -21,6 +21,9 @@ import sys
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
+from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_runner_v1 import (
+    MASSIVE_ADAPTIVE_RL_FRESH_REPLAY_TIMEOUT_SECONDS_V1,
+)
 from rl_quant.alpha.massive_universe_adapter import checked_pit_universe_rule
 from rl_quant.alpha.pit_universe import (
     ListingEventRecord,
@@ -1521,7 +1524,7 @@ def run_persisted_v5_qualification(root: Path) -> PersistedV5QualificationRun:
         env=child_environment,
         capture_output=True,
         text=True,
-        timeout=7200,
+        timeout=MASSIVE_ADAPTIVE_RL_FRESH_REPLAY_TIMEOUT_SECONDS_V1,
         check=False,
     )
     if child.returncode != 0:

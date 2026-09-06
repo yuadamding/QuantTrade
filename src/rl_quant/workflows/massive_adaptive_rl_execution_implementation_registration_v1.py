@@ -83,6 +83,10 @@ from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_scope_v1 impo
     massive_adaptive_rl_vertical_qualification_scope_active_v1,
     require_massive_adaptive_rl_vertical_qualification_experiment_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_runner_v1 import (
+    MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_TIMEOUT_SECONDS_V1,
+    _run_vertical_qualification_process_v1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_DATASET = (
@@ -384,19 +388,35 @@ def _vertical_qualification(
         nonpass_outcome_labels: tuple[str, ...] = ("not-run",)
         passed = False
     else:
+        started_at = time.monotonic()
         try:
-            completed = subprocess.run(
+            completed = _run_vertical_qualification_process_v1(
                 (sys.executable, *command[1:]),
                 cwd=repository_root,
-                check=False,
-                capture_output=True,
-                timeout=1_800,
+                timeout=MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_TIMEOUT_SECONDS_V1,
                 env=massive_adaptive_rl_deterministic_environment_v1(os.environ),
             )
+        except subprocess.TimeoutExpired as error:
+            raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                "V5 vertical qualification timed out after "
+                f"{MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_TIMEOUT_SECONDS_V1}s; "
+                "operational failure, not an economic result; "
+                "execution registration was not published"
+            ) from error
         except (OSError, subprocess.SubprocessError) as error:
             raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
                 "V5 vertical qualification could not execute"
             ) from error
+        finally:
+            # Operational timing stays out of canonical receipts and CLI JSON.
+            print(
+                "V5 vertical qualification "
+                f"elapsed_seconds={time.monotonic() - started_at:.3f} "
+                "timeout_seconds="
+                f"{MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_TIMEOUT_SECONDS_V1}",
+                file=sys.stderr,
+                flush=True,
+            )
         normalized_output = re.sub(
             rb"\bin [0-9]+(?:\.[0-9]+)?s\b",
             b"in <duration>",
