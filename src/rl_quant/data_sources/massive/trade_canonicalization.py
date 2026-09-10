@@ -28,6 +28,8 @@ MASSIVE_TRADE_CANONICALIZATION_SPEC_SHA256 = semantic_sha256(
         "condition_order": "sorted-unique",
         "tape": "integer-or-null",
         "delayed_receive_time": "clock-error-upper-bound",
+        "vendor_clocks": "preserve-participant-sip-trf-without-cross-clock-order-inference",
+        "strategy_event_clock_guard": "availability-not-before-participant-or-sip",
     }
 )
 
@@ -130,10 +132,16 @@ class MassiveCanonicalTradeSourceRecord:
             "sip_timestamp_ns",
         ):
             _integer(name, getattr(self, name))
-        if self.participant_timestamp_ns > self.sip_timestamp_ns:
-            raise MassiveTradeCanonicalizationError(
-                "participant timestamp exceeds SIP timestamp"
-            )
+        # These are observations from different vendor clocks. Preserve their
+        # signed difference, including participant > SIP; do not swap, clamp,
+        # round, or infer that one clock measures the other's event ordering.
+        # Causal normalization separately gates strategy availability against
+        # both timestamps, the entitlement delay and any local receive bound.
+        for name in ("participant_timestamp_ns", "sip_timestamp_ns"):
+            if type(getattr(self, name)) is not int:
+                raise MassiveTradeCanonicalizationError(
+                    "canonical timestamp must be a nonnegative integer"
+                )
         if self.trf_id is not None:
             _integer("TRF ID", self.trf_id)
         if self.trf_timestamp_ns is not None:

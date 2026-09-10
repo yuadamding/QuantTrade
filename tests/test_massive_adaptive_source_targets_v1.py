@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,27 @@ from rl_quant.alpha.contracts import (
     CorporateActionRecord,
     TerminalEventKind,
     TerminalEventRecord,
+)
+from rl_quant.data_sources.massive.conditions import (
+    MASSIVE_STOCK_TRADE_CONDITION_QUERY,
+    build_massive_condition_authority,
+)
+from rl_quant.data_sources.massive.finalized_listing import (
+    canonical_massive_trade_object_key,
+)
+from rl_quant.data_sources.massive.finalized_partition_manifest import (
+    build_massive_finalized_feature_domain_spec_v0,
+)
+from rl_quant.data_sources.massive.finalized_persisted_partitions import (
+    load_massive_persisted_security_rows_v2,
+    stream_and_persist_massive_daily_trade_partitions_v1,
+)
+from rl_quant.data_sources.massive.session_calendar import (
+    build_massive_session_authority,
+)
+from rl_quant.data_sources.massive.trade_extraction import (
+    MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
+    MASSIVE_FLAT_TRADES_DATASET_ID,
 )
 from rl_quant.features.massive_adaptive_fill_source_v1 import (
     MassiveAdaptiveFillRowV1,
@@ -26,6 +48,17 @@ from rl_quant.features.massive_adaptive_source_targets_v1 import (
 )
 from rl_quant.features.massive_daily_bars_v0 import MASSIVE_DAILY_BARS_V0_FIELDS
 from rl_quant.protocol.canonical_artifact import semantic_sha256
+from test_massive_finalized_whole_file_v0 import (
+    CALENDAR_RECEIPT,
+    ENTITLEMENT_RECEIPT,
+    _correction_authority,
+    _flat_payload,
+    _identity_authority,
+    _ns,
+    _publish,
+    _session,
+    _trade_row,
+)
 
 _EASTERN = ZoneInfo("America/New_York")
 
@@ -34,107 +67,169 @@ def _ms(day: str, value: time) -> int:
     return int(datetime.combine(date.fromisoformat(day), value, tzinfo=_EASTERN).timestamp() * 1_000)
 
 
-@dataclass(frozen=True)
-class _TradeRecord:
-    participant_timestamp_ns: int
-    price_decimal: str
-    size_decimal: str
-    conditions: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class _Trade:
-    canonical_record: _TradeRecord
-    receipt_sha256: str
-
-
-def _trade(day: str, at: time, *, price: float, size: float, condition: str) -> _Trade:
-    body = (day, at.isoformat(), price, size, condition)
-    return _Trade(
-        canonical_record=_TradeRecord(
-            participant_timestamp_ns=_ms(day, at) * 1_000_000,
-            price_decimal=str(price),
-            size_decimal=str(size),
-            conditions=(condition,),
+def _fill_conditions():
+    return build_massive_condition_authority(
+        tuple(
+            {
+                "id": code,
+                "name": name,
+                "asset_class": "stocks",
+                "data_types": ["trade"],
+                "update_rules": {
+                    "consolidated": {
+                        "updates_open_close": price,
+                        "updates_high_low": high_low,
+                        "updates_volume": volume,
+                    }
+                },
+            }
+            for code, name, price, high_low, volume in (
+                (1, "Price and volume, no high-low", True, False, True),
+                (2, "Volume only", False, True, True),
+                (3, "Price only", True, True, False),
+            )
         ),
-        receipt_sha256=semantic_sha256(body),
+        source_object_receipt_sha256=semantic_sha256("native-fill-conditions"),
+        source_query_path=MASSIVE_STOCK_TRADE_CONDITION_QUERY,
     )
 
 
-def test_adaptive_fill_uses_exact_morning_price_and_volume_population(monkeypatch) -> None:
-    day = "2024-01-03"
-    session_receipt = semantic_sha256("sessions")
-    condition_receipt = semantic_sha256("conditions")
-    manifest_receipt = semantic_sha256("manifest")
-    partition_receipt = semantic_sha256("partition")
+@pytest.mark.parametrize(
+    ("day", "include_eligible", "utc_hour"),
+    (
+        ("2024-01-03", True, 14),
+        ("2024-07-02", True, 13),
+        ("2024-01-03", False, 14),
+    ),
+)
+def test_adaptive_fill_uses_exact_morning_price_and_volume_population(
+    tmp_path: Path, day: str, include_eligible: bool, utc_hour: int
+) -> None:
+    session = _session(day)
+    session_authority = build_massive_session_authority(
+        (session,), calendar_source_receipt_sha256=CALENDAR_RECEIPT
+    )
+    condition_authority = _fill_conditions()
+    corrections = _correction_authority()
+    feature_spec = build_massive_finalized_feature_domain_spec_v0(
+        condition_authority=condition_authority, correction_authority=corrections
+    )
+    definitions = (
+        ("BEFORE", time(9, 34, 59), "90", "10", "", 0, None),
+        ("OPEN", time(9, 35), "100", "2", "1" if include_eligible else "2", 0, None),
+        ("CANCELLED", time(9, 38), "777", "50", "", 0, None),
+        ("VOLUME", time(9, 40), "999", "50", "2", 0, None),
+        ("PRICE", time(9, 41), "888", "50", "3", 0, None),
+        (
+            "LAST",
+            time(9, 44, 59, 999000),
+            "110",
+            "1",
+            "" if include_eligible else "3",
+            0,
+            None,
+        ),
+        ("END", time(9, 45), "120", "10", "", 0, None),
+        ("CANCELLED", time(9, 38), "777", "50", "", 2, time(9, 46)),
+    )
+    raw_rows = []
+    for sequence, (trade_id, at, price, size, condition, correction, reported) in enumerate(
+        definitions, start=1
+    ):
+        raw = list(
+            _trade_row(
+                ticker="AAA",
+                trade_id=trade_id,
+                participant_ns=_ns(day, at),
+                sip_ns=_ns(day, reported or at),
+                price=price,
+                size=size,
+                correction=correction,
+                sequence=sequence,
+            )
+        )
+        raw[1] = "[]" if not condition else f"[{condition}]"
+        raw_rows.append(tuple(raw))
+    loaded = _publish(
+        root=tmp_path / "source",
+        key=canonical_massive_trade_object_key(day),
+        payload=_flat_payload(tuple(raw_rows)),
+        dataset_id=MASSIVE_FLAT_TRADES_DATASET_ID,
+        schema_sha256=MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
+        downloaded_at_ms=_ms(day, time(17)),
+        etag="native-morning-fill-fixture",
+    )
+    _, _, manifest = stream_and_persist_massive_daily_trade_partitions_v1(
+        source_root=tmp_path / "source",
+        loaded_source=loaded,
+        spool_root=tmp_path / "spool",
+        persisted_root=tmp_path / "persisted",
+        session_authority=session_authority,
+        session=session,
+        identity_authority=_identity_authority(day, ("AAA",)),
+        condition_authority=condition_authority,
+        correction_authority=corrections,
+        feature_domain_spec=feature_spec,
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        published_at_ms=_ms(day, time(17, 1)),
+    )
+    partition = manifest.partitions[0]
+    _, active, _ = load_massive_persisted_security_rows_v2(
+        root=tmp_path / "persisted", partition=partition
+    )
+    assert active
+    assert all(row.canonical_record.trade_id != "CANCELLED" for row in active)
+    # Only the daily receipt binding is a nonauthorizing unit-test stand-in.
+    # Conditions, gzip parsing, correction replay and persisted trades are native.
     daily_receipt = semantic_sha256("daily")
     daily_row_receipt = semantic_sha256("daily-row")
-    session_authority = SimpleNamespace(
-        receipt_sha256=session_receipt,
-        validate=lambda: None,
-    )
-    condition_authority = SimpleNamespace(
-        receipt_sha256=condition_receipt,
-        validate=lambda: None,
-        resolve=lambda values: (
-            values == ("ok",),
-            False,
-            values == ("ok",),
-            False,
-        ),
-    )
     daily_session = SimpleNamespace(
         source_session_date=day,
-        persisted_partition_manifest_receipt_sha256=manifest_receipt,
+        persisted_partition_manifest_receipt_sha256=manifest.receipt_sha256,
     )
     daily_row = SimpleNamespace(receipt_sha256=daily_row_receipt)
     daily = SimpleNamespace(
-        session_authority_receipt_sha256=session_receipt,
-        condition_authority_receipt_sha256=condition_receipt,
-        supported_security_ids=("SEC-A",),
+        session_authority_receipt_sha256=session_authority.receipt_sha256,
+        condition_authority_receipt_sha256=condition_authority.receipt_sha256,
+        supported_security_ids=("SEC-AAA",),
         sessions=(daily_session,),
         semantic_receipt_sha256=daily_receipt,
         daily_input_data_qualified=False,
         validate=lambda: None,
         row=lambda **_: daily_row,
     )
-    partition = SimpleNamespace(
-        security_id="SEC-A", receipt_sha256=partition_receipt
-    )
-    manifest = SimpleNamespace(
-        source_session_date=day,
-        receipt_sha256=manifest_receipt,
-        partitions=(partition,),
-        validate=lambda: None,
-    )
-    trades = (
-        _trade(day, time(9, 34, 59), price=90.0, size=10.0, condition="ok"),
-        _trade(day, time(9, 35), price=100.0, size=2.0, condition="ok"),
-        _trade(day, time(9, 44, 59), price=110.0, size=1.0, condition="ok"),
-        _trade(day, time(9, 40), price=999.0, size=50.0, condition="excluded"),
-        _trade(day, time(9, 45), price=120.0, size=10.0, condition="ok"),
-    )
-    monkeypatch.setattr(
-        "rl_quant.features.massive_adaptive_fill_source_v1.load_massive_persisted_security_rows_v2",
-        lambda **_: ((), trades, ()),
-    )
-
     result = build_massive_adaptive_fill_source_v1(
-        persisted_root="/unused",
+        persisted_root=tmp_path / "persisted",
         session_authority=session_authority,
         condition_authority=condition_authority,
         daily_input_authority=daily,
         persisted_partition_manifests=(manifest,),
         required_session_dates=(day,),
-        supported_security_ids=("SEC-A",),
+        supported_security_ids=("SEC-AAA",),
     )
 
     row = result.rows[0]
     assert (row.fill_start_at_ms, row.fill_end_at_ms) == adaptive_fill_clock_v1(day)
-    assert row.qualifying_trade_count == 2
-    assert row.qualifying_share_volume == 3.0
-    assert row.fill_vwap == pytest.approx(310.0 / 3.0)
+    assert row.fill_start_at_ms == _ms(day, time(9, 35))
+    assert (
+        datetime.fromtimestamp(row.fill_start_at_ms / 1_000, ZoneInfo("UTC")).hour
+        == utc_hour
+    )
+    assert row.valid is include_eligible
+    assert row.qualifying_trade_count == (2 if include_eligible else 0)
+    assert row.qualifying_share_volume == (3.0 if include_eligible else 0.0)
+    assert row.qualifying_dollar_volume == (310.0 if include_eligible else 0.0)
+    assert row.fill_vwap == pytest.approx(310.0 / 3.0 if include_eligible else 0.0)
+    expected_trades = tuple(
+        trade.receipt_sha256
+        for trade in active
+        if include_eligible and trade.canonical_record.trade_id in {"OPEN", "LAST"}
+    )
+    assert row.qualifying_trade_inventory_sha256 == semantic_sha256(expected_trades)
+    assert row.persisted_partition_receipt_sha256 == partition.receipt_sha256
+    assert row.daily_input_row_receipt_sha256 == daily_row_receipt
     assert result.source_paths_replayed
+    assert not result.source_data_qualified
     assert not result.predictive_training_authorized
 
 

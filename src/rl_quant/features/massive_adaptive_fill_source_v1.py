@@ -287,7 +287,7 @@ def build_massive_adaptive_fill_source_v1(
                 )
                 for trade in active:
                     at_ms = trade.canonical_record.participant_timestamp_ns // 1_000_000
-                    price_forming, _, volume_forming, _ = condition_authority.resolve(
+                    price_forming, _, volume_forming = condition_authority.resolve(
                         trade.canonical_record.conditions
                     )
                     if start <= at_ms < end and price_forming and volume_forming:

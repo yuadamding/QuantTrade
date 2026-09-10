@@ -62,7 +62,8 @@ def _identity():
     )
 
 
-def test_flat_file_extraction_reads_every_committed_row(tmp_path: Path) -> None:
+@pytest.mark.parametrize("conditions,expected", [("[1]", (1,)), ("1", (1,)), ('"1,12"', (1, 12))])
+def test_flat_file_extraction_reads_every_committed_row(tmp_path: Path, conditions, expected) -> None:
     sip = int(
         datetime(
             2026, 8, 20, 10, 0, tzinfo=ZoneInfo("America/New_York")
@@ -72,7 +73,7 @@ def test_flat_file_extraction_reads_every_committed_row(tmp_path: Path) -> None:
     loaded = _loaded(
         tmp_path,
         HEADER
-        + f"AAA,[1],0,4,T1,{sip - 1},10,1,{sip},100,1,,\n"
+        + f"AAA,{conditions},0,4,T1,{sip - 1},10,1,{sip},100,1,,\n"
         + f"BBB,[1],0,4,T2,{sip - 1},20,1,{sip},200,1,,\n",
     )
 
@@ -85,6 +86,7 @@ def test_flat_file_extraction_reads_every_committed_row(tmp_path: Path) -> None:
     assert len(records) == 1
     assert records[0].source_row_number == 2
     assert records[0].canonical_record.tape_id == 1
+    assert records[0].canonical_record.conditions == expected
     assert evidence.source_row_count == 2
     assert evidence.selected_row_count == 1
     assert evidence.unselected_row_count == 1

@@ -4,6 +4,14 @@ This index separates current scientific contracts from development-only
 training guides and immutable historical records. Documentation and local
 tests are not launch or performance evidence.
 
+For the fixed 200-equity data preparation path, read
+[QT200 inputs for adaptive V5 PPO](qt200_v5_training_data.md). It distinguishes
+the legacy intraday loader from the native V5 source graph and records the
+remaining real-data integration gates without changing the scientific protocol.
+The [historical-message census](qt200_historical_message_census.md) documents
+the bounded, lossless diagnostic for blank IDs, quantities and correction
+references; diagnostic completion never grants native or training qualification.
+
 ## Current Hold-30 and M03R direction
 
 - [QuantTrade training knowledge base](quanttrade_training_knowledge_base.md)

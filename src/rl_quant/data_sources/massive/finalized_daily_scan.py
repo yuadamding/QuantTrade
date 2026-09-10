@@ -9,7 +9,7 @@ import gzip
 import hashlib
 from io import TextIOWrapper
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from rl_quant.data_sources.massive.corrections import MassiveCorrectionAuthority
@@ -32,6 +32,8 @@ from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADE_COLUMNS,
     MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
     MassiveExtractedTradeRow,
+    MassiveTradeExtractionError,
+    _parse_conditions as _parse_trade_conditions,
 )
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_payload,
@@ -87,22 +89,12 @@ def _timestamp_date(timestamp_ns: int) -> str:
 
 
 def _parse_conditions(value: str) -> tuple[int, ...]:
-    import json
-
-    stripped = value.strip()
-    if not stripped:
-        return ()
+    # Share the CSV grammar with per-security extraction. In particular a
+    # singleton like "12" is a valid provider cell, not a JSON-list error.
     try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        parsed = [
-            item
-            for item in stripped.replace("[", "").replace("]", "").split(",")
-            if item
-        ]
-    if not isinstance(parsed, Sequence) or isinstance(parsed, (str, bytes)):
-        raise MassiveDailyTradeFileScanError("flat-file conditions are malformed")
-    return tuple(int(item) for item in parsed)
+        return _parse_trade_conditions(value)
+    except MassiveTradeExtractionError as exc:
+        raise MassiveDailyTradeFileScanError("flat-file conditions are malformed") from exc
 
 
 def _parse_row(raw_line: str, *, source_row_number: int) -> list[str]:

@@ -444,20 +444,35 @@ class MassiveTradeExtractionEvidence:
 
 
 def _parse_conditions(value: str) -> tuple[int, ...]:
+    """Decode the CSV cell without dropping or coercing condition IDs.
+
+    Provider CSV uses an empty cell, a single integer (e.g. ``12``), or
+    comma-separated integers. JSON arrays remain supported for existing
+    source fixtures. JSON's scalar-number result must not be mistaken for
+    a malformed condition inventory.
+    """
     stripped = value.strip()
     if not stripped:
         return ()
     try:
         parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        parsed = [
-            item
-            for item in stripped.replace("[", "").replace("]", "").split(",")
-            if item
-        ]
+    except json.JSONDecodeError as exc:
+        if "[" in stripped or "]" in stripped:
+            raise MassiveTradeExtractionError("flat-file conditions are malformed") from exc
+        parsed = stripped.split(",")
+    if type(parsed) is int:
+        parsed = (parsed,)
     if not isinstance(parsed, Sequence) or isinstance(parsed, (str, bytes)):
         raise MassiveTradeExtractionError("flat-file conditions are malformed")
-    return tuple(int(item) for item in parsed)
+    values = []
+    for item in parsed:
+        if type(item) is int and item >= 0:
+            values.append(item)
+        elif isinstance(item, str) and item.strip().isascii() and item.strip().isdecimal():
+            values.append(int(item.strip()))
+        else:
+            raise MassiveTradeExtractionError("flat-file conditions are malformed")
+    return tuple(values)
 
 
 def _parse_csv_line(raw_line: str, *, source_row_number: int) -> list[str]:

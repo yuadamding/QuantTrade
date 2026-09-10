@@ -256,11 +256,13 @@ class MassiveTradeEventV3:
             _nonnegative_int("TRF timestamp", self.trf_timestamp_ns)
         if self.tape_id is not None:
             _nonnegative_int("tape ID", self.tape_id)
-        if self.participant_timestamp_ns > self.sip_timestamp_ns:
-            raise MassiveTradeReplayError("participant timestamp exceeds SIP timestamp")
         if self.strategy_available_timestamp_ns < self.sip_timestamp_ns:
             raise MassiveTradeReplayError(
                 "strategy availability precedes SIP dissemination"
+            )
+        if self.strategy_available_timestamp_ns < self.participant_timestamp_ns:
+            raise MassiveTradeReplayError(
+                "strategy availability precedes participant timestamp"
             )
         if self.source_kind == "delayed-websocket":
             if (
