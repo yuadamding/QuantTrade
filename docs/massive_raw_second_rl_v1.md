@@ -40,6 +40,40 @@ Even a multi-sample batch may have equal advantages; sample count alone does
 not guarantee a nonzero policy gradient. A controlled economic-learning test,
 representative one-H100 profiling and actual-data evaluation remain separate.
 
+## Controlled economic-learning diagnostic
+
+`test_raw_second_economic_learning_v1.py` uses the unchanged experiment runner,
+Transformer, action distribution, PPO loss and ledger on a separately frozen
+synthetic process. Two synthetic equities exchange favorable and unfavorable
+roles in balanced, shuffled blocks. Completed raw-second high/low excursions
+precede the decision; later OPENs initially retain the old price, and opposing
+3% price movements occur afterward. Generator labels are diagnostic-only and
+never enter market tensors, account state, actions or rewards.
+
+The process deliberately uses extreme OHLC excursions, prices near 10,000 and
+20,000-share per-second volume. These arbitrary raw units isolate a learnable
+mechanism without normalizing inputs; they do not qualify realistic source
+scales. The ten-million capital, 2% participation limit, 80% per-asset cap,
+25% drawdown limit and ordinary 10/20/40-bp cost scenarios remain explicit.
+Both compared policies face the same constraints and potential fill clipping.
+
+Before any model initializes, the fixture publishes its specification and fixed
+criterion. Optimizer seeds 17/29/43 share the same market histories; training,
+validation and test have distinct generator streams and chronological catalogs.
+Each seed receives one pass over 256 training transitions, sixteen 16-transition
+rollouts and four PPO epochs per rollout (64 optimizer minibatches), with 32
+validation and 32 test transitions. The small model has width 16 and an
+eight-second raw context; this is not the intended-universe H100 profile.
+
+All three actual reports are retained before checking the primary 20-bp
+learning criterion: at least two seeds improve over initialization; median net
+improvement exceeds 0.01; median trained return exceeds CASH; median requested
+favorable-minus-unfavorable allocation exceeds 0.05, and its median improvement
+over initialization exceeds 0.02. Validation alone selects each checkpoint.
+A failed criterion remains a completed negative learning diagnostic; it must
+not become a skip, a favorable seed selection or an automatic retuned retry.
+Positive actual-market returns are never an engineering acceptance requirement.
+
 ## Implemented boundary
 
 `rl-quant.massive-raw-second-window-v1` admits Massive REST unadjusted second
@@ -234,7 +268,8 @@ python -B -m pytest -q -m lsf_gpu \
   tests/test_massive_raw_second_rl_v1.py \
   tests/test_raw_second_experiment_v1.py \
   tests/test_raw_second_partitions_v1.py \
-  tests/test_raw_second_learning_v1.py
+  tests/test_raw_second_learning_v1.py \
+  tests/test_raw_second_economic_learning_v1.py
 python -B -m pytest -q -m lsf_gpu tests/test_raw_second_fresh_process_v1.py
 ```
 
