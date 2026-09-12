@@ -96,6 +96,7 @@ class RawSecondActorCritic(PPOActorCritic):
 
     def __init__(self, catalog: RawSecondCatalog, config: RawSecondModelConfig | None = None):
         super().__init__()
+        self._frozen_evaluation = False
         self.catalog = catalog
         self.config = RawSecondModelConfig() if config is None else config
         c = self.config
@@ -123,6 +124,27 @@ class RawSecondActorCritic(PPOActorCritic):
     def set_extra_state(self, state: dict) -> None:
         if state != self.get_extra_state():
             raise ValueError("Checkpoint input schema, configuration or raw catalog differs")
+
+    def policy_contract(self) -> dict:
+        """Portable inference compatibility; dates remain training provenance."""
+        return {k: v for k, v in self.get_extra_state().items() if k != "catalog"} | {
+            "input_contract": asdict(self.catalog.windows[0].contract),
+        }
+
+    def freeze_for_evaluation(self) -> None:
+        self.eval()
+        self.requires_grad_(False)
+        self._frozen_evaluation = True
+
+    def train(self, mode: bool = True):
+        if mode and self._frozen_evaluation:
+            raise ValueError("Frozen evaluation policy cannot enter training mode")
+        return super().train(mode)
+
+    def requires_grad_(self, requires_grad: bool = True):
+        if requires_grad and self._frozen_evaluation:
+            raise ValueError("Frozen evaluation policy cannot enable gradients")
+        return super().requires_grad_(requires_grad)
 
     def _asset_chunk(self, raw: torch.Tensor, observed: torch.Tensor, valid: torch.Tensor,
                      asset_indices: torch.Tensor) -> torch.Tensor:
@@ -164,8 +186,8 @@ class RawSecondActorCritic(PPOActorCritic):
             raise ValueError("Raw equity identity/order differs")
         if observation.raw_ohlcv.shape[2] > self.config.max_context_seconds:
             raise ValueError("Raw context exceeds model bound; no resampling fallback")
-        if any(p.dtype != torch.float32 or not p.requires_grad for p in self.parameters()):
-            raise ValueError("The entire raw-second policy must remain trainable FP32")
+        if any(p.dtype != torch.float32 or p.requires_grad == self._frozen_evaluation for p in self.parameters()):
+            raise ValueError("Raw-second FP32 train/frozen parameter contract differs")
         raw = observation.raw_ohlcv
         chunks = []
         for start in range(0, raw.shape[1], self.config.asset_chunk_size):

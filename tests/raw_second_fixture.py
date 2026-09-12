@@ -16,6 +16,8 @@ from rl_quant.envs.raw_second_portfolio_v1 import RawSecondPortfolioEnv, SecondE
 from rl_quant.models.raw_second_policy_v1 import RawSecondActorCritic, RawSecondModelConfig
 from rl_quant.rl.ppo import PPOConfig
 from rl_quant.training.raw_second_ppo_v1 import RawSecondPPOTrainer
+from rl_quant.datasets.raw_second_economics_v1 import ECONOMIC_SCHEMA, SecondEconomicInputs
+from hashlib import sha256
 
 START = int(datetime(2017, 1, 3, 14, 30, tzinfo=timezone.utc).timestamp()) * 1000
 
@@ -28,25 +30,47 @@ def response(query, rows, *, next_url=None):
     return json.dumps(body, separators=(",", ":")).encode()
 
 
-def make_catalog(root: Path) -> RawSecondCatalog:
+def make_catalog(root: Path, *, start=START, falling=False) -> RawSecondCatalog:
     captures = []
     for i, ticker in enumerate(("AAPL", "BRK.B")):
-        query = SecondQuery(ticker, START, START + 63_000)
+        query = SecondQuery(ticker, start, start + 63_000)
         rows = []
         for second in range(64):
             if second in (10, 20):
                 continue  # complete source, explicitly known-empty intervals
-            price = 100 + i * 25 + (1 if i == 0 else -1) * second * 0.125
-            rows.append(dict(t=START + second * 1000, o=price, h=price + 0.25, l=price - 0.25,
+            price = 100 + i * 25 + (1 if i == 0 and not falling else -1) * second * 0.125
+            rows.append(dict(t=start + second * 1000, o=price, h=price + 0.25, l=price - 0.25,
                              c=price + 0.0625, v=3_000_000 + second, vw=price + 0.03125, n=300))
         next_url = query.url + "&cursor=page-two"
-        pages = (CapturedSecondPage(query.url, START + 1_000_000, response(query, rows[:30], next_url=next_url)),
-                 CapturedSecondPage(next_url, START + 1_000_001, response(query, rows[30:])))
+        pages = (CapturedSecondPage(query.url, start + 1_000_000, response(query, rows[:30], next_url=next_url)),
+                 CapturedSecondPage(next_url, start + 1_000_001, response(query, rows[30:])))
         captures.append(publish_second_capture(root / ticker, query, pages))
     contract = RawSecondContract("historical-finalized-assumed-delay", 0)
     return RawSecondCatalog(tuple(RawSecondWindowRef(tuple(captures), ("fixture-issue-apple", "fixture-issue-berkshire-b"),
-                                                    START, 64, START + step * 1000, contract)
+                                                    start, 64, start + step * 1000, contract)
                                   for step in (16, 24, 32, 40, 48)))
+
+
+def event_coverage(root: Path, catalogs, *, splits=(), dividends=()):
+    """Explicit complete synthetic event census, not a real-data qualification."""
+    root.mkdir(parents=True, exist_ok=False)
+    start = min(w.start_ms for c in catalogs for w in c.windows)
+    end = max(w.decision_ms for c in catalogs for w in c.windows)
+    sessions = []
+    for stamp in sorted({w.start_ms for c in catalogs for w in c.windows}):
+        session = datetime.fromtimestamp(stamp / 1000, timezone.utc).date().isoformat()
+        sessions.append(dict(session_date=session, open_ms=stamp, close_ms=stamp + 23_400_000))
+    def terms(row):
+        return {k: str(v) if k in ("shares_from", "shares_to", "cash_per_share") else v for k, v in asdict(row).items()}
+    source = json.dumps(dict(splits=[terms(s) for s in splits], dividends=[terms(d) for d in dividends]), sort_keys=True).encode()
+    (root / "census.json").write_bytes(source)
+    doc = dict(schema=ECONOMIC_SCHEMA, asset_ids=catalogs[0].asset_ids, coverage_start_ms=start,
+               coverage_end_ms=end, basis="synthetic-complete-census", sessions=sessions,
+               splits=[terms(s) for s in splits], dividends=[terms(d) for d in dividends], unsupported_events=[],
+               sources=[dict(path=str(root / "census.json"), sha256=sha256(source).hexdigest())])
+    body = json.dumps(doc, sort_keys=True).encode()
+    (root / "coverage.json").write_bytes(body)
+    return SecondEconomicInputs(str(root / "coverage.json"), sha256(body).hexdigest())
 
 
 def save_catalog(catalog: RawSecondCatalog, path: Path):

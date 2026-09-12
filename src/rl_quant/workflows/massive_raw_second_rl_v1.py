@@ -16,6 +16,7 @@ from pathlib import Path
 import torch
 
 from rl_quant.datasets.massive_raw_seconds_v1 import RawSecondCatalog, _write
+from rl_quant.datasets.raw_second_economics_v1 import SecondEconomicInputs
 from rl_quant.envs.raw_second_portfolio_v1 import RawSecondPortfolioEnv, SecondExecutionConfig
 from rl_quant.models.raw_second_policy_v1 import RawSecondActorCritic, RawSecondModelConfig
 from rl_quant.rl.ppo import PPOConfig
@@ -26,6 +27,7 @@ def run_raw_second_engineering_episode(
     *, catalog: RawSecondCatalog, output: Path, device: str,
     model_config: RawSecondModelConfig, execution_config: SecondExecutionConfig,
     ppo_config: PPOConfig, rollout_steps: int,
+    economic_inputs: SecondEconomicInputs,
 ) -> dict:
     """One numerical integration episode, no economic eligibility assertion.
 
@@ -46,7 +48,9 @@ def run_raw_second_engineering_episode(
         catalog.load(index, device=target)
     torch.manual_seed(ppo_config.seed)
     model = RawSecondActorCritic(catalog, model_config).to(target)
-    env = RawSecondPortfolioEnv(catalog, config=execution_config, device=target)
+    splits, dividends, sessions = economic_inputs.load(catalog)
+    env = RawSecondPortfolioEnv(catalog, config=execution_config, device=target,
+                                splits=splits, dividends=dividends, sessions=sessions)
     agent = RawSecondPPOTrainer(model, env, ppo_config)
     output.mkdir(parents=True, exist_ok=False)
     updates, trajectory = [], []
@@ -64,6 +68,7 @@ def run_raw_second_engineering_episode(
     summary = dict(schema="rl-quant.massive-raw-second-engineering-run-v1", catalog_sha256=catalog.identity,
                    asset_ids=catalog.asset_ids, input_contract=asdict(catalog.windows[0].contract),
                    model_config=asdict(model_config), execution_config=asdict(execution_config),
+                   economic_inputs=asdict(economic_inputs), ledger=env.audit,
                    ppo_config=asdict(ppo_config), checkpoint_sha256=checkpoint_sha,
                    optimizer_updates=len(updates), updates=updates, trajectory=trajectory,
                    fills=[asdict(fill) for fill in env.fills], terminal_equity=str(env.current_equity),

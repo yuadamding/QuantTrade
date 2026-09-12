@@ -28,8 +28,8 @@ jobs:
       - name: Type check (advisory)
         continue-on-error: true
         run: python -m mypy src
-      - name: Tests
-        run: python -m pytest -q --cov=rl_quant --cov-report=term-missing
+      - name: CPU-compatible tests (external LSF GPU acceptance remains required)
+        run: python -m pytest -q -m "not lsf_gpu" --cov=rl_quant --cov-report=term-missing
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v2
 

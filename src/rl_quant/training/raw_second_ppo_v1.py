@@ -25,6 +25,8 @@ from rl_quant.rl.trajectory import OnPolicyTrajectoryBuffer
 class RawSecondPPOTrainer:
     def __init__(self, model: RawSecondActorCritic, environment: RawSecondPortfolioEnv,
                  config: PPOConfig | None = None):
+        if model._frozen_evaluation or any(not p.requires_grad for p in model.parameters()):
+            raise ValueError("Frozen evaluation policies have no optimizer/update route")
         if model.catalog.identity != environment.catalog.identity:
             raise ValueError("Model and ledger must share the exact raw references")
         self.algorithm = RecurrentPPO(model, config)
@@ -64,7 +66,7 @@ class RawSecondPPOTrainer:
         env = self.environment
         state = dict(schema=SCHEMA, catalog=env.catalog.identity, model_contract=self.algorithm.model.get_extra_state(),
                      execution_config=asdict(env.config), splits=[asdict(e) for e in env.splits],
-                     dividends=[asdict(e) for e in env.dividends], algorithm=self.algorithm.state_dict(),
+                     dividends=[asdict(e) for e in env.dividends], sessions=[asdict(s) for s in env.sessions], algorithm=self.algorithm.state_dict(),
                      cpu_rng=torch.get_rng_state(),
                      cuda_rng=torch.cuda.get_rng_state(self.algorithm.device) if self.algorithm.device.type == "cuda" else None,
                      device_type=self.algorithm.device.type, runtime=self.runtime_profile(),
@@ -75,7 +77,7 @@ class RawSecondPPOTrainer:
                                       last_marks={a: str(p) for a, p in env.last_marks.items()},
                                       known_marks={a: str(p) for a, p in env.known_marks.items()},
                                       peak=str(env.peak), risk_halted=env.risk_halted, equity=str(env.current_equity),
-                                      fills=[asdict(f) for f in env.fills]))
+                                      fills=[asdict(f) for f in env.fills], audit=env.audit))
         # Decimal event terms are serialized as strings, not pickle globals.
         for family in ("splits", "dividends"):
             state[family] = [{k: str(v) if isinstance(v, Decimal) else v for k, v in e.items()} for e in state[family]]
@@ -86,19 +88,19 @@ class RawSecondPPOTrainer:
         return sha256(body).hexdigest()
 
     def load(self, path: Path, expected_sha256: str, *, inference_only: bool = False) -> None:
+        if inference_only:
+            raise ValueError("Use load_frozen_raw_second_policy; resume is never an evaluation interface")
         state = torch.load(io.BytesIO(_read(path, expected_sha256)), map_location=self.algorithm.device, weights_only=True)
         env = self.environment
         if (state["schema"] != SCHEMA or state["catalog"] != env.catalog.identity
                 or state["model_contract"] != self.algorithm.model.get_extra_state()
-                or state["execution_config"] != asdict(env.config)):
+                or state["execution_config"] != asdict(env.config)
+                or state.get("sessions") != [asdict(s) for s in env.sessions]):
             raise ValueError("Checkpoint source/model/ledger configuration differs")
         for family in ("splits", "dividends"):
             expected = [{k: str(v) if isinstance(v, Decimal) else v for k, v in asdict(e).items()} for e in getattr(env, family)]
             if state[family] != expected:
                 raise ValueError("Checkpoint corporate-action population differs")
-        if inference_only:
-            self.algorithm.model.load_state_dict(state["algorithm"]["model"], strict=True)
-            return
         if state["runtime"] != self.runtime_profile():
             raise ValueError("Optimizer resume requires the frozen device profile; CPU is inference-only")
         state["algorithm"]["minibatch_rng_state"] = state["algorithm"]["minibatch_rng_state"].cpu()
@@ -113,7 +115,17 @@ class RawSecondPPOTrainer:
         env.peak, env.current_equity = Decimal(book["peak"]), Decimal(book["equity"])
         env.risk_halted = book["risk_halted"]
         env.fills = [SecondFill(**f) for f in book["fills"]]
+        env.audit = book["audit"]
         torch.set_rng_state(state["cpu_rng"].cpu())
         if self.algorithm.device.type == "cuda":
             torch.cuda.set_rng_state(state["cuda_rng"].cpu(), self.algorithm.device)
         env.observation()  # read-only source revalidation before further work
+
+    def freeze(self, path: Path) -> str:
+        """Export tensor-only policy weights; no optimizer, RNG or ledger state."""
+        from rl_quant.evaluation.raw_second_policy_v1 import write_frozen_raw_second_policy
+
+        return write_frozen_raw_second_policy(self.algorithm.model, path,
+            training_provenance=dict(catalog_sha256=self.environment.catalog.identity,
+                last_reward_timestamp_ms=self.environment.catalog.windows[self.environment.index].decision_ms,
+                optimizer_updates=self.algorithm.update_count, ppo_config=asdict(self.algorithm.config)))

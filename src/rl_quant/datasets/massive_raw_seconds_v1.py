@@ -142,12 +142,23 @@ class CapturedSecondPage:
 
 
 def _safe_url(url: str, query: SecondQuery) -> None:
+    if not isinstance(url, str) or any(ord(c) <= 32 or ord(c) >= 127 for c in url):
+        raise ValueError("Noncanonical pagination URL")
     parsed = urlsplit(url)
     expected = urlsplit(query.url)
-    args = parse_qs(parsed.query)
-    if (parsed.scheme != "https" or parsed.netloc != "api.massive.com" or parsed.path != expected.path
+    args = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+    # Provider cursors may advance the start timestamp in the path. They may
+    # not change the ticker, second multiplier, original end, or query scope.
+    prefix = expected.path.rsplit("/", 2)[0] + "/"
+    bounds = parsed.path[len(prefix):].split("/") if parsed.path.startswith(prefix) else []
+    bounded_path = (len(bounds) == 2 and bounds[0].isascii() and bounds[0].isdigit()
+                    and str(int(bounds[0])) == bounds[0]
+                    and query.start_ms <= int(bounds[0]) <= query.end_ms
+                    and bounds[1] == str(query.end_ms))
+    if (parsed.scheme != "https" or parsed.netloc != "api.massive.com" or not bounded_path
             or parsed.fragment or not set(args).issubset({"adjusted", "sort", "limit", "cursor"})
-            or any(len(v) != 1 for v in args.values())
+            or any(len(v) != 1 or not v[0] for v in args.values())
+            or (url != query.url and "cursor" not in args)
             or args.get("adjusted", ["false"]) != ["false"]
             or args.get("sort", ["asc"]) != ["asc"]
             or args.get("limit", ["50000"]) != ["50000"]):

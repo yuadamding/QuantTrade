@@ -1,0 +1,195 @@
+"""Bounded REST-second acquisition using the existing header-only transport.
+
+Plans precede credential loading. Raw HTTP evidence is never training readiness.
+The second-input handoff is byte-preserving, not a resampler or feature builder.
+No provider credential loader or remote credential transport is introduced.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+import gzip
+from io import BytesIO
+from pathlib import Path
+
+from rl_quant.data_sources.massive import qt200_research_capture_v1 as transport
+from rl_quant.data_sources.massive.qt200_daily_capture_v1 import SYMBOLS
+from rl_quant.datasets.massive_raw_seconds_v1 import (
+    CapturedSecondPage, SecondCaptureRef, SecondQuery, _safe_url, publish_second_capture,
+)
+
+SCHEMA = "rl-quant.raw-second-rest-capture-v1"
+MAX_QUERIES = 24
+MAX_QUERY_SECONDS = 3600
+MAX_BYTES = 128_000_000
+MAX_PAGES = 8
+
+
+class SecondHTTPQuery(SecondQuery):
+    @property
+    def name(self) -> str:
+        return f"second-{self.ticker}-{self.start_ms}-{self.end_ms}"
+
+    def validate_url(self, url: str) -> str:
+        _safe_url(url, self)
+        return url
+
+    def inspect_page(self, raw: bytes) -> dict:
+        body = transport.parse_json(raw)
+        rows = body.get("results", [])
+        if (body.get("status") != "OK" or body.get("ticker") != self.ticker
+                or body.get("adjusted") is not False or not isinstance(rows, list)
+                or any(not isinstance(r, dict) for r in rows)
+                or type(body.get("resultsCount")) is not int or body["resultsCount"] != len(rows)
+                or not isinstance(body.get("request_id"), str) or not body["request_id"]
+                or len(rows) > 50_000):
+            raise transport.ResearchCaptureError("Wrong second response identity/population")
+        next_url = body.get("next_url")
+        if next_url is not None:
+            self.validate_url(next_url)
+        if next_url is None and (len(rows) >= 50_000 or body.get("queryCount", 0) >= 50_000):
+            raise transport.ResearchCaptureError("Unresolved query-limit coverage")
+        return dict(result_count=len(rows), provider_request_id=body["request_id"], next_url=next_url,
+                    field_names=sorted({k for row in rows for k in row}),
+                    point_in_time_qualified=False, training_ready=False)
+
+
+def _queries(queries: tuple[SecondQuery, ...]) -> tuple[SecondHTTPQuery, ...]:
+    if (not isinstance(queries, tuple) or not 1 <= len(queries) <= MAX_QUERIES
+            or any(not isinstance(q, SecondQuery) for q in queries)):
+        raise ValueError("Expected a bounded explicit second-query population")
+    result = tuple(SecondHTTPQuery(**asdict(q)) for q in queries)
+    if len({q.name for q in result}) != len(result):
+        raise ValueError("Duplicate second query")
+    for index, query in enumerate(result):
+        if query.ticker not in SYMBOLS:
+            raise ValueError("Second pilot must stay within the fixed QT200 symbols")
+        if query.end_ms - query.start_ms >= MAX_QUERY_SECONDS * 1000:
+            raise ValueError("Pilot queries are limited to one hour each")
+        for earlier in result[:index]:
+            if (query.ticker == earlier.ticker
+                    and max(query.start_ms, earlier.start_ms) <= min(query.end_ms, earlier.end_ms)):
+                raise ValueError("Overlapping source queries")
+    return result
+
+
+def _fields(queries) -> dict:
+    return dict(schema=SCHEMA + "-plan", queries=[asdict(q) for q in _queries(queries)],
+        maximum_raw_response_bytes=MAX_BYTES, maximum_page_bytes=transport.MAX_PAGE_BYTES,
+        maximum_pages_per_query=MAX_PAGES, maximum_elapsed_seconds=transport.MAX_CAPTURE_SECONDS,
+        retry_count=0, concurrent_requests=1, minimum_request_gap_seconds=0.3,
+        market_fields=["open", "high", "low", "close", "volume"],
+        training_ready=False, point_in_time_qualified=False, native_v5_qualified=False)
+
+
+def publish_second_capture_plan(*, root: Path, queries: tuple[SecondQuery, ...]) -> str:
+    """Publish the bounded scope before an acquisition owner opens its key."""
+    body = {**_fields(queries),
+        "capture_implementation_sha256": transport.digest(Path(transport.__file__).read_bytes()),
+        "second_implementation_sha256": transport.digest(Path(__file__).read_bytes())}
+    root.mkdir(parents=True, exist_ok=False)
+    return transport.write_once(root / "plan.json", transport.canonical(body))["sha256"]
+
+
+def _plan(root: Path, expected_sha256: str, *, current: bool) -> tuple[SecondHTTPQuery, ...]:
+    raw = transport.read_regular(root / "plan.json", 1_048_576)
+    body = transport.parse_json(raw)
+    if transport.digest(raw) != expected_sha256:
+        raise ValueError("Second capture plan changed")
+    queries = _queries(tuple(SecondQuery(**q) for q in body["queries"]))
+    fields = _fields(queries)
+    if (set(body) != set(fields) | {"capture_implementation_sha256", "second_implementation_sha256"}
+            or any(body[k] != v or type(body[k]) is not type(v) for k, v in fields.items())):
+        raise ValueError("Second capture plan contract differs")
+    if current and (body["second_implementation_sha256"] != transport.digest(Path(__file__).read_bytes())
+                    or body["capture_implementation_sha256"] != transport.digest(Path(transport.__file__).read_bytes())):
+        raise ValueError("Capture implementation changed after planning")
+    return queries
+
+
+def capture_seconds(*, root: Path, plan_sha256: str, api_key: str) -> dict:
+    queries = _plan(root, plan_sha256, current=True)
+    return transport._capture_queries(root=root, plan_sha256=plan_sha256, api_key=api_key,
+        queries=queries, schema=SCHEMA, maximum_bytes=MAX_BYTES, maximum_pages=MAX_PAGES)
+
+
+def replay_second_capture(*, root: Path, plan_sha256: str, completion_sha256: str) -> dict:
+    queries = _plan(root, plan_sha256, current=False)
+    return transport._replay_queries(root=root, plan_sha256=plan_sha256, completion_sha256=completion_sha256,
+        queries=queries, schema=SCHEMA, maximum_bytes=MAX_BYTES, maximum_pages=MAX_PAGES)
+
+
+def _pages(root: Path, query: SecondHTTPQuery, entry: dict) -> tuple[CapturedSecondPage, ...]:
+    """Call only after the complete transport chain has been hash-replayed."""
+    pages = []
+    base = root / query.name
+    complete_raw = transport.read_regular(base / "COMPLETE.json", 1_048_576)
+    if transport.digest(complete_raw) != entry["completion"]["sha256"]:
+        raise ValueError("Query completion changed during handoff")
+    complete = transport.parse_json(complete_raw)
+    for index in range(entry["page_count"]):
+        receipt_raw = transport.read_regular(base / f"page-{index:04d}.receipt.json", 1_048_576)
+        if transport.digest(receipt_raw) != complete["pages"][index]["sha256"]:
+            raise ValueError("Page receipt changed during handoff")
+        receipt = transport.parse_json(receipt_raw)
+        packed = transport.read_regular(base / f"page-{index:04d}.json.gz", transport.MAX_PAGE_BYTES + 1_048_576)
+        if transport.digest(packed) != receipt["body"]["sha256"]:
+            raise ValueError("Capture body changed during handoff")
+        with gzip.GzipFile(fileobj=BytesIO(packed)) as stream:
+            body = stream.read(transport.MAX_PAGE_BYTES + 1)
+            if len(body) > transport.MAX_PAGE_BYTES or stream.read(1):
+                raise ValueError("Expanded second page exceeds bound")
+        if transport.digest(body) != receipt["raw_body_sha256"]:
+            raise ValueError("Original second response hash differs")
+        # Round up, never make receipt-time observations available early.
+        pages.append(CapturedSecondPage(receipt["request_url"], (receipt["received_at_ns"] + 999_999) // 1_000_000, body))
+    return tuple(pages)
+
+
+def materialize_second_sources(*, root: Path, plan_sha256: str, completion_sha256: str, output: Path) -> dict:
+    before = replay_second_capture(root=root, plan_sha256=plan_sha256, completion_sha256=completion_sha256)
+    queries = _plan(root, plan_sha256, current=False)
+    complete = transport.parse_json(transport.read_regular(root / "COMPLETE.json", 1_048_576))
+    output.mkdir(parents=True, exist_ok=False)
+    refs = []
+    for query, entry in zip(queries, complete["queries"], strict=True):
+        ref = publish_second_capture(output / query.name, SecondQuery(**asdict(query)), _pages(root, query, entry))
+        ref.load()
+        refs.append(asdict(ref))
+    if replay_second_capture(root=root, plan_sha256=plan_sha256, completion_sha256=completion_sha256) != before:
+        raise ValueError("Source capture changed during materialization")
+    result = dict(schema=SCHEMA + "-raw-sources", capture_sha256=completion_sha256,
+        plan_sha256=plan_sha256, captures=refs, raw_values_transformed=False,
+        historical_issue_identity_qualified=False, corporate_actions_qualified=False,
+        point_in_time_qualified=False, training_ready=False)
+    transport.write_once(output / "COMPLETE.json", transport.canonical(result))
+    return result
+
+
+def verify_second_sources(*, root: Path, plan_sha256: str, completion_sha256: str,
+                          output: Path, output_sha256: str) -> dict:
+    before = replay_second_capture(root=root, plan_sha256=plan_sha256, completion_sha256=completion_sha256)
+    queries = _plan(root, plan_sha256, current=False)
+    capture = transport.parse_json(transport.read_regular(root / "COMPLETE.json", 1_048_576))
+    raw = transport.read_regular(output / "COMPLETE.json", 1_048_576)
+    if transport.digest(raw) != output_sha256:
+        raise ValueError("Raw-source completion changed")
+    body = transport.parse_json(raw)
+    expected = dict(schema=SCHEMA + "-raw-sources", capture_sha256=completion_sha256,
+        plan_sha256=plan_sha256, captures=body["captures"], raw_values_transformed=False,
+        historical_issue_identity_qualified=False, corporate_actions_qualified=False,
+        point_in_time_qualified=False, training_ready=False)
+    if transport.canonical(body) != transport.canonical(expected) or len(body["captures"]) != len(queries):
+        raise ValueError("Raw-source completion claims differ")
+    if {p.name for p in output.iterdir()} != {"COMPLETE.json", *(q.name for q in queries)}:
+        raise ValueError("Raw-source file population differs")
+    for query, entry, ref in zip(queries, capture["queries"], body["captures"], strict=True):
+        if ref["path"] != str(output / query.name):
+            raise ValueError("Raw-source reference escaped its population")
+        actual_query, actual_pages = SecondCaptureRef(**ref).load()
+        if asdict(actual_query) != asdict(query) or actual_pages != _pages(root, query, entry):
+            raise ValueError("Raw inputs differ from captured response bytes")
+    if replay_second_capture(root=root, plan_sha256=plan_sha256, completion_sha256=completion_sha256) != before:
+        raise ValueError("Capture changed during verification")
+    return dict(output_sha256=output_sha256, nonmaterializing=True, raw_response_identity_verified=True,
+                training_ready=False)

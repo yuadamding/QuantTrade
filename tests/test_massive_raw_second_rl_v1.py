@@ -13,7 +13,7 @@ import sys
 import pytest
 import torch
 
-from raw_second_fixture import START, configure, make_catalog, response, save_catalog, trainer
+from raw_second_fixture import START, configure, event_coverage, make_catalog, response, save_catalog, trainer
 from rl_quant.datasets.massive_raw_seconds_v1 import (
     CapturedSecondPage, RawSecondCatalog, RawSecondContract, RawSecondWindowRef, SecondQuery,
     load_raw_second_window, publish_second_capture,
@@ -22,6 +22,8 @@ from rl_quant.envs.raw_second_portfolio_v1 import RawSecondPortfolioEnv, SecondE
 from rl_quant.execution.qt200_aggregate_execution_v1 import Book, Dividend, Split, apply_actions, equity
 from rl_quant.rl.types import ActionBatch
 from rl_quant.workflows.massive_raw_second_rl_v1 import run_raw_second_engineering_episode
+
+pytestmark = pytest.mark.lsf_gpu
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -247,11 +249,13 @@ def test_carried_episode_split_reconciles_without_adjusting_raw_seconds(tmp_path
     assert not transition.terminated.item()
 
 
-def test_checkpoint_resume_and_fresh_process_replay(catalog, tmp_path):
+def test_checkpoint_resume_and_fresh_cpu_inference(catalog, tmp_path):
     agent = trainer(catalog)
     agent.update(agent.collect(steps=2))
     checkpoint = tmp_path / "policy.pt"
     checkpoint_sha = agent.save(checkpoint)
+    frozen = tmp_path / "frozen.pt"
+    frozen_sha = agent.freeze(frozen)
     catalog_path = tmp_path / "catalog.json"
     save_catalog(catalog, catalog_path)
     obs = agent.environment.observation()
@@ -264,10 +268,15 @@ def test_checkpoint_resume_and_fresh_process_replay(catalog, tmp_path):
                     metrics=metrics, deterministic=deterministic), reference)
     script = Path(__file__).with_name("raw_second_resume_probe.py")
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CUBLAS_WORKSPACE_CONFIG=":4096:8")
-    for mode in ("resume", "cpu-inference"):
+    restored = trainer(catalog)
+    restored.load(checkpoint, checkpoint_sha)
+    resumed = restored.collect(steps=2)
+    assert restored.update(resumed) == metrics
+    torch.testing.assert_close(resumed.as_batch().actions, second.as_batch().actions, rtol=0, atol=0)
+    for mode in ("cpu-inference",):
         child_env = {**env, **({"CUDA_VISIBLE_DEVICES": ""} if mode == "cpu-inference" else {})}
         result = subprocess.run([sys.executable, "-B", str(script), str(catalog_path), str(checkpoint), checkpoint_sha,
-                                 str(reference), mode], env=child_env, text=True, capture_output=True, timeout=120)
+                                 str(reference), mode, str(frozen), frozen_sha], env=child_env, text=True, capture_output=True, timeout=120)
         assert result.returncode == 0, result.stdout + result.stderr
     assert sha256(checkpoint.read_bytes()).hexdigest() == checkpoint_sha
     with pytest.raises(FileExistsError):
@@ -281,7 +290,7 @@ def test_persisted_raw_second_workflow(tmp_path_factory):
     before = {str(p): sha256(p.read_bytes()).hexdigest() for p in (root / "sources").rglob("*") if p.is_file()}
     result = run_raw_second_engineering_episode(catalog=catalog, output=root / "run", device="cuda:0",
              model_config=agent.algorithm.model.config, execution_config=agent.environment.config,
-             ppo_config=agent.algorithm.config, rollout_steps=2)
+             ppo_config=agent.algorithm.config, rollout_steps=2, economic_inputs=event_coverage(root / "events", (catalog,)))
     assert result["engineering_execution_complete"] and result["optimizer_updates"] == 2
     assert result["fills"] and len(result["trajectory"]) == 4
     assert result["hardware"]["peak_cuda_allocated_bytes"] > 0
