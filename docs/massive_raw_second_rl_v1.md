@@ -42,6 +42,23 @@ action, historical-availability or training qualification. Existing
 daily/minute aggregates and trades cannot be expanded or relabeled as these
 REST seconds. No real second-bar corpus has been qualified by this change.
 
+`SecondPartitionSet` resolves bounded immutable captures for a single instrument
+without manufacturing a combined provider response. Observations query their
+own raw context; the catalog's independently indexed source sets cover execution
+and ledger marks. Additional intervening captures can be bound explicitly through
+`execution_sources`. Every read verifies original bytes. Overlap must agree in
+both OHLCV and observed-versus-empty status; conflicting vintages fail closed.
+Identical duplicate observations retain all source hashes and their earliest
+actual receipt. An uncovered interval remains unknown, never zero liquidity.
+Regular-session execution requires complete coverage of the eligible session
+intervals between decisions, including marks after order expiry; calendar-closed
+overnights need no capture. This does not relax coverage inside an open session.
+
+The new catalog identity is `rl-quant.raw-second-catalog-v2`. The corrected ledger
+and chronological report have distinct v2 identities, and old price-only resume
+states are rejected. Previously published reports remain historical artifacts;
+they must not be silently replayed or relabeled under changed execution semantics.
+
 The allowed pre-encoder operations are parsing, validation, clock alignment,
 masking and numeric casting. Configuration rejects returns, features,
 scalers, resampling, adjusted values, forward fill, covariates and news.
@@ -95,6 +112,11 @@ execution proxies, **not observed bid/ask fills or empirical capacity**.
 Terminal liquidation is a costed mark adjustment, not observed exit liquidity.
 
 The book carries across sessions. Corporate events apply in the ledger only.
+Ledger marks retain the raw source second, availability time and current share
+basis. A pre-split close read after a split is translated into the current book
+basis; it cannot overwrite a rebased cache with an old-basis price. Accounting
+and decision-known marks have separate state, persisted for exact resume. A
+newer accounting price does not make a delayed observation available to sizing.
 Reward is exactly `log(equity_after / equity_before)`; costs are already in
 equity and are not subtracted again. Cash/share, fill, fee, notional and terminal
 diagnostics remain outside model market inputs. Finalized prices and event
@@ -126,9 +148,15 @@ study-level selection/access gate.
 development experiment. Each PPO update yields a resume checkpoint and portable
 frozen policy. Only validation net return selects a candidate, with earliest
 update as deterministic tie-breaker. `selection.json` commits before test
-captures open. Test evaluation includes CASH, initial equal-weight buy-and-hold
+captures open. Test evaluation includes CASH, **one-shot-entry** equal-weight buy-and-hold
 subject to the same asset/gross caps, and the original same-seed untrained
-policy. Cost scenarios rerun the same frozen policy on the same raw inputs;
+policy. Unfilled initial benchmark orders expire; there are no subsequent catch-up
+buys. These are constraint-matched, not necessarily exposure-matched comparisons.
+The report includes first-entry share completion valued at decision marks,
+average/maximum risky exposure and cash allocation. Exposure is explicitly an
+unweighted decision-interval-end sample before terminal liquidation, not a
+continuous-time average; these diagnostics never enter market inputs.
+Cost scenarios rerun the same frozen policy on the same raw inputs;
 actions may differ with cost-dependent account state. This is not a frozen-
 target cost estimand and does not assert monotone returns.
 
@@ -167,7 +195,11 @@ operator integration, not established by the CPU workflow alone.
 On an assigned LSF GPU run these in **separate processes**, in order:
 
 ```bash
-python -B -m pytest -q -m lsf_gpu tests/test_massive_raw_second_rl_v1.py tests/test_raw_second_experiment_v1.py
+python -B -m pytest -q -m lsf_gpu \
+  tests/test_raw_second_capture_v1.py \
+  tests/test_massive_raw_second_rl_v1.py \
+  tests/test_raw_second_experiment_v1.py \
+  tests/test_raw_second_partitions_v1.py
 python -B -m pytest -q -m lsf_gpu tests/test_raw_second_fresh_process_v1.py
 ```
 

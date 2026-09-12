@@ -14,9 +14,14 @@ def main():
     configure()
     mode, location = sys.argv[1:]
     root = Path(location)
-    if mode == "prepare":
-        catalogs = tuple(make_catalog(root / role, start=START + i * 86_400_000, falling=role == "test")
-                         for i, role in enumerate(("train", "validation", "test")))
+    if mode in ("prepare", "prepare-partitions"):
+        if mode == "prepare-partitions":
+            from test_raw_second_partitions_v1 import _continuous_catalog
+            catalogs = tuple(_continuous_catalog(root / role, START + offset * 86_400_000)
+                             for role, offset in (("train", 0), ("validation", 2), ("test", 6)))
+        else:
+            catalogs = tuple(make_catalog(root / role, start=START + i * 86_400_000, falling=role == "test")
+                             for i, role in enumerate(("train", "validation", "test")))
         for role, catalog in zip(("train", "validation", "test"), catalogs, strict=True):
             save_catalog(catalog, root / (role + ".json"))
         events = event_coverage(root / "events", catalogs)

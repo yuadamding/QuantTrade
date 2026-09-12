@@ -1,4 +1,4 @@
-"""Frozen-policy and exposure-matched baseline evaluation through one ledger."""
+"""Frozen-policy and constraint-matched baseline evaluation through one ledger."""
 
 from __future__ import annotations
 
@@ -49,6 +49,12 @@ def economic_summary(env: RawSecondPortfolioEnv) -> dict:
         previous = value
     volatility = stdev(daily_returns) * math.sqrt(252) if len(daily_returns) > 1 else None
     sharpe = mean(daily_returns) * 252 / volatility if volatility else None
+    exposures = [float(D(r["risky_marked_notional"]) / D(r["pre_terminal_equity"])) for r in env.audit]
+    cash_allocations = [float(D(r["pre_terminal_cash"]) / D(r["pre_terminal_equity"])) for r in env.audit]
+    entry_requested = D(env.audit[0]["requested_notional"])
+    entry_filled = D(env.audit[0]["filled_order_notional_at_decision_marks"])
+    if entry_filled < 0 or entry_filled > entry_requested:
+        raise ValueError("Initial order completion does not reconcile with fills")
     return dict(net_return=float(prior / initial - 1), terminal_equity=str(prior),
                 cumulative_net_log_return=log_return, maximum_drawdown=float(drawdown),
                 daily_equity={k: str(v) for k, v in daily.items()}, daily_returns=daily_returns,
@@ -61,6 +67,12 @@ def economic_summary(env: RawSecondPortfolioEnv) -> dict:
                 sell_fill_count=sum(D(f.signed_shares) < 0 for f in env.fills),
                 requested_notional=str(sum((D(r["requested_notional"]) for r in env.audit), D(0))),
                 unfilled_order_intervals=sum(any(D(q) for q in r["unfilled_shares"].values()) for r in env.audit),
+                average_risky_exposure=mean(exposures), maximum_risky_exposure=max(exposures),
+                average_cash_allocation=mean(cash_allocations), maximum_cash_allocation=max(cash_allocations),
+                exposure_sampling="unweighted-decision-interval-end;before-terminal-mark-liquidation;not-time-weighted",
+                initial_entry_requested_notional=str(entry_requested),
+                initial_entry_filled_notional_at_decision_marks=str(entry_filled),
+                initial_entry_completion_fraction=float(entry_filled / entry_requested) if entry_requested else None,
                 ending_cash=str(env.book.cash), ending_receivables=str(sum((r.amount for r in env.book.receivables), D(0))))
 
 
@@ -96,6 +108,8 @@ def evaluate_raw_second_policy(*, catalog: RawSecondCatalog, economic_inputs: Se
     economic_inputs.load(catalog)
     return dict(catalog_sha256=catalog.identity, economic_inputs=asdict(economic_inputs),
                 execution_config=asdict(execution_config), baseline=baseline,
+                entry_convention="one-shot-first-decision-interval;unfilled-remainder-expires;no-catch-up-buys" if baseline == "buy-and-hold" else None,
+                baseline_comparability="same-constraints-not-necessarily-same-realized-exposure",
                 policy_sha256=policy.artifact_sha256 if policy else None,
                 parameter_sha256=policy.parameter_sha256 if policy else None,
                 summary=economic_summary(env), ledger=env.audit,

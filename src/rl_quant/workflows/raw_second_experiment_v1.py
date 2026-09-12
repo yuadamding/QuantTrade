@@ -23,7 +23,7 @@ from rl_quant.models.raw_second_policy_v1 import RawSecondActorCritic, RawSecond
 from rl_quant.rl.ppo import PPOConfig
 from rl_quant.training.raw_second_ppo_v1 import RawSecondPPOTrainer
 
-EXPERIMENT_SCHEMA = "rl-quant.raw-second-chronological-experiment-v1"
+EXPERIMENT_SCHEMA = "rl-quant.raw-second-chronological-experiment-v2"
 
 
 def _publish(path: Path, body: dict) -> str:
@@ -53,13 +53,14 @@ def _split_metadata(catalogs: dict[str, RawSecondCatalog]) -> dict:
 
 def _validate_sources(catalog: RawSecondCatalog, *, next_split_start: int | None, device) -> None:
     checked = set()
-    for index, window in enumerate(catalog.windows):
-        for capture in window.captures:
+    for source in catalog.sources:
+        for capture in source.partitions:
             if capture.manifest_sha256 not in checked:
                 query, _ = capture.load()
                 if next_split_start is not None and query.end_ms >= next_split_start:
                     raise ValueError("Earlier-role capture contains later scored outcomes")
                 checked.add(capture.manifest_sha256)
+    for index in range(len(catalog.windows)):
         catalog.load(index, device=device)
 
 
@@ -117,7 +118,7 @@ def run_raw_second_experiment(*, training: RawSecondCatalog, validation: RawSeco
         model_config=asdict(model_config), execution_config=asdict(execution_config), ppo_config=asdict(ppo_config),
         rollout_steps=rollout_steps, cost_rungs=cost_rungs,
         selection_rule="maximum-validation-net-return;earliest-update-breaks-ties",
-        baseline_rule="cash;initial-cap-matched-equal-weight-buy-and-hold;same-seed-untrained-policy")
+        baseline_rule="cash;one-shot-entry-cap-matched-equal-weight-buy-and-hold;same-seed-untrained-policy")
     output.mkdir(parents=True, exist_ok=False)
     plan_sha = _publish(output / "plan.json", plan)
     _validate_sources(training, next_split_start=validation.windows[0].decision_ms, device=target)

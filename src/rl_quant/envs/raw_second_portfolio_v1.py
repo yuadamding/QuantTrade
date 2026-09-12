@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 import torch
 
-from rl_quant.datasets.massive_raw_seconds_v1 import RawSecondCatalog, _rows
+from rl_quant.datasets.massive_raw_seconds_v1 import RawSecondCatalog
 from rl_quant.datasets.raw_second_economics_v1 import SecondSession
 from rl_quant.execution.qt200_aggregate_execution_v1 import (
     Book, Dividend, Split, apply_actions, equity, liquidate,
@@ -25,6 +25,7 @@ from rl_quant.execution.qt200_aggregate_execution_v1 import (
 from rl_quant.rl.types import ActionBatch, ObservationBatch, RewardComponents, TransitionBatch
 
 D = Decimal
+LEDGER_SCHEMA = "rl-quant.raw-second-partitioned-split-basis-ledger-v2"
 
 
 def _session(stamp: int) -> str:
@@ -71,6 +72,27 @@ class SecondFill:
     fee: str
 
 
+@dataclass(frozen=True)
+class SecondLedgerMark:
+    """An accounting-only price, with observation time and current share basis."""
+
+    price: Decimal
+    second_start_ms: int
+    available_at_ms: int
+    share_basis_date: str
+
+    def rebase(self, asset: str, book: Book, splits: Sequence[Split]) -> SecondLedgerMark:
+        price = self.price
+        target = book.action_date or self.share_basis_date
+        with localcontext() as context:
+            context.prec = 34
+            for event in sorted(splits, key=lambda e: (e.effective_date, e.event_id)):
+                if (event.instrument == asset and event.event_id in book.applied_events
+                        and self.share_basis_date < event.effective_date <= target):
+                    price *= event.shares_from / event.shares_to
+        return replace(self, price=price, share_basis_date=target)
+
+
 class RawSecondPortfolioEnv:
     """Chronological, carried-book engineering environment, one episode.
 
@@ -89,6 +111,10 @@ class RawSecondPortfolioEnv:
         self.device = torch.device(device)
         self.splits, self.dividends = tuple(splits), tuple(dividends)
         self.sessions = tuple(sessions)
+        if (tuple(sorted(self.sessions, key=lambda s: s.open_ms)) != self.sessions
+                or len({s.session_date for s in self.sessions}) != len(self.sessions)
+                or any(a.close_ms > b.open_ms for a, b in zip(self.sessions, self.sessions[1:]))):
+            raise ValueError("Session calendar must be unique, ordered and nonoverlapping")
         if (self.config.observation_session == "regular-only" or self.config.execution_session == "regular-only"
                 or self.config.order_expiry == "session-close") and not self.sessions:
             raise ValueError("A bound session calendar is required, including early closes")
@@ -110,30 +136,35 @@ class RawSecondPortfolioEnv:
                     raise ValueError("Raw observation context extends outside a regular session")
         self.reset()
 
-    def _market(self, index: int) -> dict[str, list]:
-        ref = self.catalog.windows[index]
-        result = {}
-        for asset, capture in zip(ref.asset_ids, ref.captures, strict=True):
-            query, pages = capture.load()
-            result[asset] = _rows(query, pages)
-        return result
+    @property
+    def last_marks(self) -> dict[str, Decimal]:
+        return {asset: mark.price for asset, mark in self.accounting_mark_state.items()}
+
+    @property
+    def known_marks(self) -> dict[str, Decimal]:
+        return {asset: mark.price for asset, mark in self.known_mark_state.items()}
 
     def _marks(self, index: int, *, available_only: bool) -> dict[str, Decimal]:
         ref = self.catalog.windows[index]
-        prices = {}
-        for asset, rows in self._market(index).items():
-            eligible = []
+        state = self.known_mark_state if available_only else self.accounting_mark_state
+        for asset in ref.asset_ids:
+            # Lookup against the source store, not only the current neural
+            # context. Last-known ledger marks may outlive that bounded context.
+            rows = self.catalog.resolve(asset, min(w.start_ms for w in self.catalog.windows),
+                                        ref.decision_ms, require_complete=False).rows
             for stamp, values, received in rows:
                 scope = self.config.observation_session if available_only else self.config.execution_session
                 if scope == "regular-only" and not any(s.open_ms <= stamp and stamp + 1000 <= s.close_ms for s in self.sessions):
                     continue
                 arrival = received if ref.contract.availability_assumption == "captured-receipt-time" else stamp + 1000 + ref.contract.availability_delay_ms
                 if stamp + 1000 <= ref.decision_ms and (not available_only or arrival <= ref.decision_ms):
-                    eligible.append(values[3])
-            if eligible:
-                prices[asset] = D(str(eligible[-1]))
+                    if asset not in state or stamp >= state[asset].second_start_ms:
+                        # A delayed old close is translated into the *book's*
+                        # share basis, never reapplied as an unadjusted mark.
+                        state[asset] = SecondLedgerMark(D(str(values[3])), stamp, max(arrival, stamp + 1000),
+                                                       _session(stamp)).rebase(asset, self.book, self.splits)
         # A last-known mark belongs only in the ledger, never the market tensor.
-        return {**(self.known_marks if available_only else self.last_marks), **prices}
+        return self.known_marks if available_only else self.last_marks
 
     def _actions_through(self, stamp: int) -> None:
         target = _session(stamp)
@@ -145,16 +176,13 @@ class RawSecondPortfolioEnv:
                 split_rows = [e for e in self.splits if e.effective_date == session]
                 self.book = apply_actions(self.book, session, splits=split_rows,
                                            dividends=[e for e in self.dividends if e.ex_date == session])
-                for event in split_rows:
-                    if event.instrument in self.last_marks:
-                        self.last_marks[event.instrument] *= event.shares_from / event.shares_to
-                    if event.instrument in self.known_marks:
-                        self.known_marks[event.instrument] *= event.shares_from / event.shares_to
+                for state in (self.accounting_mark_state, self.known_mark_state):
+                    for asset, mark in state.items():
+                        state[asset] = mark.rebase(asset, self.book, self.splits)
 
     def observation(self) -> ObservationBatch:
         self.catalog.load(self.index, device=self.device)  # validate coverage before acting
         prices = self._marks(self.index, available_only=True)
-        self.known_marks = prices
         shares = dict(self.book.holdings)
         account = [float(self.book.cash), *(float(shares.get(asset, D(0))) for asset in self.catalog.asset_ids)]
         mask = [True, *(asset in prices and not self.risk_halted for asset in self.catalog.asset_ids)]
@@ -169,14 +197,14 @@ class RawSecondPortfolioEnv:
     def reset(self) -> tuple[ObservationBatch, dict]:
         self.index = 0
         self.book = Book(D(self.config.capital))
-        self.last_marks: dict[str, Decimal] = {}
-        self.known_marks: dict[str, Decimal] = {}
+        self.accounting_mark_state: dict[str, SecondLedgerMark] = {}
+        self.known_mark_state: dict[str, SecondLedgerMark] = {}
         self.peak = D(self.config.capital)
         self.risk_halted = False
         self.fills: list[SecondFill] = []
         self.audit: list[dict] = []
         self._actions_through(self.catalog.windows[0].decision_ms)
-        self.last_marks = self._marks(0, available_only=False)
+        self._marks(0, available_only=False)
         self.current_equity = equity(self.book, self.last_marks)
         return self.observation(), {}
 
@@ -201,17 +229,19 @@ class RawSecondPortfolioEnv:
         expiry = end
         if self.config.order_expiry == "session-close":
             expiry = min(end, next(s.close_ms for s in self.sessions if s.open_ms <= decision <= s.close_ms))
-        market = self._market(self.index + 1)
+        # Require complete eligible-session coverage even after an order expires:
+        # subsequent marks still affect the carried book. Closed calendar time
+        # needs no fictitious overnight response or liquidity record.
+        intervals = [(decision, end)]
+        if self.config.execution_session == "regular-only":
+            intervals = [(max(decision, s.open_ms), min(end, s.close_ms)) for s in self.sessions
+                         if max(decision, s.open_ms) < min(end, s.close_ms)]
         events: dict[int, dict] = {}
-        for asset, rows in market.items():
-            query, _ = self.catalog.windows[self.index + 1].captures[self.catalog.asset_ids.index(asset)].load()
-            if query.start_ms > decision or query.end_ms + 1000 < end:
-                raise ValueError("Unknown execution coverage; do not invent zero liquidity")
-            for stamp, values, _ in rows:
-                eligible_session = self.config.execution_session == "all-captured" or any(
-                    s.open_ms <= stamp and stamp + 1000 <= s.close_ms for s in self.sessions)
-                if decision < stamp and stamp + 1000 <= expiry and eligible_session:
-                    events.setdefault(stamp, {})[asset] = (D(str(values[0])), D(str(values[4])))
+        for asset in self.catalog.asset_ids:
+            for left, right in intervals:
+                for stamp, values, _ in self.catalog.resolve(asset, left, right).rows:
+                    if decision < stamp and stamp + 1000 <= expiry:
+                        events.setdefault(stamp, {})[asset] = (D(str(values[0])), D(str(values[4])))
         cash, fills = self.book.cash, []
         rate = D(self.config.cost_basis_points) / 10_000
         for stamp, bars in sorted(events.items()):
@@ -249,8 +279,17 @@ class RawSecondPortfolioEnv:
                     remaining[asset] -= bought
                     fills.append(SecondFill(asset, stamp, str(bought), str(price), str(fee)))
         self.book = replace(self.book, cash=cash, holdings=tuple(sorted((a, q) for a, q in shares.items() if q)))
+        filled_at_decision_marks = D(0)
+        for fill in fills:
+            quantity = abs(D(fill.signed_shares))
+            for event in self.splits:
+                if event.instrument == fill.asset_id and _session(decision) < event.effective_date <= _session(fill.second_start_ms):
+                    quantity *= event.shares_from / event.shares_to
+            filled_at_decision_marks += quantity * prices[fill.asset_id]
         self._last_orders = dict(requested_orders=requested_orders, unfilled_shares={a: str(q) for a, q in remaining.items()},
-                                 requested_notional=str(requested_notional), expiry_ms=expiry)
+                                 requested_notional=str(requested_notional), expiry_ms=expiry,
+                                 filled_order_notional_at_decision_marks=str(filled_at_decision_marks),
+                                 decision_marks={a: str(p) for a, p in prices.items()})
         return fills, sum((D(f.fee) for f in fills), D(0))
 
     @torch.no_grad()
@@ -271,13 +310,15 @@ class RawSecondPortfolioEnv:
             fills, fees = self._execute(requested[0], decision, end, submit_orders=submit_orders)
             self.index += 1
             self._actions_through(end)
-            self.last_marks = self._marks(self.index, available_only=False)
+            self._marks(self.index, available_only=False)
             after = equity(self.book, self.last_marks)
             self.peak = max(self.peak, after)
             self.risk_halted |= 1 - after / self.peak > D(self.config.maximum_drawdown)
             terminal = self.index == len(self.catalog.windows) - 1
             liquidation_fee = D(0)
             pre_liquidation_holdings = self.book.holdings
+            pre_liquidation_cash = self.book.cash
+            pre_liquidation_equity = after
             liquidation_notional = sum((q * self.last_marks[a] for a, q in pre_liquidation_holdings), D(0)) if terminal else D(0)
             if terminal:
                 self.book, liquidation_fee = liquidate(self.book, self.last_marks, cost_bps=D(self.config.cost_basis_points))
@@ -291,7 +332,12 @@ class RawSecondPortfolioEnv:
             applied_events=self.book.applied_events, transaction_costs=str(fees), terminal_liquidation_cost=str(liquidation_fee),
             terminal_liquidation_notional=str(liquidation_notional),
             pre_liquidation_holdings=[(a, str(q)) for a, q in pre_liquidation_holdings] if terminal else [],
+            pre_terminal_cash=str(pre_liquidation_cash), pre_terminal_equity=str(pre_liquidation_equity),
+            risky_marked_notional=str(sum((q * self.last_marks[a] for a, q in pre_liquidation_holdings), D(0))),
             marks={a: str(p) for a, p in self.last_marks.items()},
+            mark_provenance={a: dict(second_start_ms=m.second_start_ms, available_at_ms=m.available_at_ms,
+                                    share_basis_date=m.share_basis_date) for a, m in self.accounting_mark_state.items()},
+            ledger_schema=LEDGER_SCHEMA,
             reward_net_log_equity=math.log(float(after / before))))
         if before <= 0 or after <= 0:
             raise ValueError("Nonpositive equity")

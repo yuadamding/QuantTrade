@@ -259,8 +259,104 @@ def publish_second_capture(root: Path, query: SecondQuery, pages: tuple[Captured
 
 
 @dataclass(frozen=True)
+class SecondPartitionSet:
+    """One instrument's immutable source partitions, not a merged provider response.
+
+    Ticker, overlap and physical completeness are verified by the reader. Merely
+    constructing this metadata must not open a later experiment role's sources.
+    """
+
+    partitions: tuple[SecondCaptureRef, ...]
+
+    def __post_init__(self) -> None:
+        if (type(self.partitions) is not tuple or not self.partitions
+                or any(type(p) is not SecondCaptureRef for p in self.partitions)
+                or len({p.manifest_sha256 for p in self.partitions}) != len(self.partitions)):
+            raise ValueError("Unique immutable second partitions are required")
+
+    @property
+    def identity(self) -> str:
+        return digest(dict(schema="rl-quant.second-partition-set-v1",
+                           partitions=[p.manifest_sha256 for p in self.partitions]))
+
+
+def second_partitions(source: SecondCaptureRef | SecondPartitionSet) -> tuple[SecondCaptureRef, ...]:
+    if type(source) is SecondCaptureRef:
+        return (source,)
+    if type(source) is SecondPartitionSet:
+        return source.partitions
+    raise ValueError("Only immutable raw second capture partitions are allowed")
+
+
+@dataclass(frozen=True)
+class ResolvedSecondInterval:
+    """Lossless observed rows plus verified half-open clock coverage.
+
+    Gaps are UNKNOWN, not zero volume. Coverage receipt times also determine
+    when an absent observation may be called known-empty in receipt-time mode.
+    """
+
+    rows: tuple
+    coverage: tuple[tuple[int, int, int], ...]
+    source_hashes: tuple[str, ...]
+
+    def coverage_receipt(self, stamp: int) -> int | None:
+        receipts = [receipt for start, end, receipt in self.coverage if start <= stamp < end]
+        return min(receipts) if receipts else None
+
+
+def resolve_second_interval(source: SecondCaptureRef | SecondPartitionSet, start_ms: int, end_ms: int,
+                            *, require_complete: bool = True) -> ResolvedSecondInterval:
+    """Resolve [start, end) without resampling, filling, scaling or revision guesses.
+
+    Equal overlapping observations coalesce, retaining all source identities and
+    the earliest actual receipt. A changed value OR observed/empty disagreement
+    is an ambiguous vintage and fails closed. No learned representations cache.
+    """
+    _integer(start_ms, "interval start")
+    _integer(end_ms, "interval end")
+    if start_ms % 1000 or end_ms % 1000 or end_ms < start_ms:
+        raise ValueError("Expected an aligned half-open second interval")
+    population, coverage, hashes = {}, [], []
+    ticker = None
+    previous = []
+    for capture in second_partitions(source):
+        query, pages = capture.load()
+        if ticker is not None and ticker != query.ticker:
+            raise ValueError("Mixed ticker partitions cannot establish an issue identity")
+        ticker = query.ticker
+        left, right = max(start_ms, query.start_ms), min(end_ms, query.end_ms + 1000)
+        if left >= right:
+            continue
+        rows = {t: (values, receipt) for t, values, receipt in _rows(query, pages) if left <= t < right}
+        for old_left, old_right, old_rows in previous:
+            overlap_left, overlap_right = max(left, old_left), min(right, old_right)
+            if overlap_left < overlap_right:
+                old_values = {t: v[0] for t, v in old_rows.items() if overlap_left <= t < overlap_right}
+                new_values = {t: v[0] for t, v in rows.items() if overlap_left <= t < overlap_right}
+                if old_values != new_values:
+                    raise ValueError("Conflicting duplicate/empty second across source partitions")
+        for stamp, (values, receipt) in rows.items():
+            if stamp in population:
+                receipt = min(receipt, population[stamp][1])
+            population[stamp] = values, receipt
+        previous.append((left, right, rows))
+        coverage.append((left, right, pages[-1].received_at_ms))
+        hashes.append(capture.manifest_sha256)
+    coverage.sort()
+    cursor = start_ms
+    for left, right, _ in coverage:
+        if require_complete and left > cursor:
+            raise ValueError("Unknown source coverage between second partitions")
+        cursor = max(cursor, right)
+    if require_complete and cursor < end_ms:
+        raise ValueError("Unknown source coverage after second partitions")
+    return ResolvedSecondInterval(tuple((t, *population[t]) for t in sorted(population)), tuple(coverage), tuple(hashes))
+
+
+@dataclass(frozen=True)
 class RawSecondWindowRef:
-    captures: tuple[SecondCaptureRef, ...]
+    captures: tuple[SecondCaptureRef | SecondPartitionSet, ...]
     asset_ids: tuple[str, ...]  # stable issue IDs, not ticker aliases
     start_ms: int
     seconds: int
@@ -272,7 +368,9 @@ class RawSecondWindowRef:
                 or not self.asset_ids or len(self.captures) != len(self.asset_ids)
                 or len(set(self.asset_ids)) != len(self.asset_ids)
                 or any(not isinstance(s, str) or not s or s == "CASH" for s in self.asset_ids)):
-            raise ValueError("One capture per unique stable equity identity is required")
+            raise ValueError("One partition source per unique stable equity identity is required")
+        for source in self.captures:
+            second_partitions(source)
         _integer(self.start_ms, "window start")
         _integer(self.seconds, "window seconds", 1)
         _integer(self.decision_ms, "decision timestamp")
@@ -281,7 +379,7 @@ class RawSecondWindowRef:
 
     @property
     def identity(self) -> str:
-        return digest(dict(schema=SCHEMA, captures=[c.manifest_sha256 for c in self.captures],
+        return digest(dict(schema=SCHEMA, captures=[c.manifest_sha256 if type(c) is SecondCaptureRef else c.identity for c in self.captures],
                            asset_ids=self.asset_ids, start_ms=self.start_ms, seconds=self.seconds,
                            decision_ms=self.decision_ms, contract=asdict(self.contract)))
 
@@ -338,14 +436,15 @@ def load_raw_second_window(ref: RawSecondWindowRef, *, device: torch.device | st
     known = torch.zeros(raw.shape[:-1], dtype=torch.bool)
     observed = torch.zeros_like(known)
     available = torch.zeros(raw.shape[:-1], dtype=torch.int64)
-    for asset, capture in enumerate(ref.captures):
-        query, pages = capture.load()
-        values = {t: (x, received) for t, x, received in _rows(query, pages)}
+    for asset, source in enumerate(ref.captures):
+        resolved = resolve_second_interval(source, ref.start_ms, ref.start_ms + ref.seconds * 1000, require_complete=False)
+        values = {t: (x, received) for t, x, received in resolved.rows}
         for index, stamp in enumerate(stamps):
             receipt_mode = ref.contract.availability_assumption == "captured-receipt-time"
-            known[0, asset, index] = query.start_ms <= stamp <= query.end_ms
+            receipt = resolved.coverage_receipt(stamp)
+            known[0, asset, index] = receipt is not None
             row = values.get(stamp)
-            arrival = (row[1] if row else pages[-1].received_at_ms) if receipt_mode else stamp + 1000 + ref.contract.availability_delay_ms
+            arrival = (row[1] if row else (receipt or stamp + 1000)) if receipt_mode else stamp + 1000 + ref.contract.availability_delay_ms
             available[0, asset, index] = max(arrival, stamp + 1000)
             if row is not None and arrival <= ref.decision_ms and stamp + 1000 <= ref.decision_ms:
                 raw[0, asset, index] = torch.tensor(row[0], dtype=torch.float32)
@@ -361,20 +460,42 @@ def load_raw_second_window(ref: RawSecondWindowRef, *, device: torch.device | st
 class RawSecondCatalog:
     """Frozen reference table. PPO stores indices AND this table's digest."""
 
-    def __init__(self, windows: tuple[RawSecondWindowRef, ...]):
+    def __init__(self, windows: tuple[RawSecondWindowRef, ...], *, execution_sources: tuple[SecondPartitionSet, ...] | None = None):
         if type(windows) is not tuple or not windows:
             raise ValueError("An immutable raw-window inventory is required")
         if any(w.asset_ids != windows[0].asset_ids or w.contract != windows[0].contract for w in windows):
             raise ValueError("Mixed universe/input contracts rejected")
         self.windows = windows
-        self.identity = digest([w.identity for w in windows])
         self.asset_ids = windows[0].asset_ids
+        if execution_sources is not None and (type(execution_sources) is not tuple
+                or len(execution_sources) != len(self.asset_ids)
+                or any(type(s) is not SecondPartitionSet for s in execution_sources)):
+            raise ValueError("Execution sources must bind each instrument's immutable partitions")
+        # Execution is indexed independently of the *next* observation window.
+        # A compact observation context need not carry all intervening sources.
+        self.execution_sources = execution_sources
+        self.sources = tuple(SecondPartitionSet(tuple({c.manifest_sha256: c
+            for source in (*(w.captures[i] for w in windows), *((execution_sources[i],) if execution_sources else ()))
+            for c in second_partitions(source)}.values())) for i in range(len(self.asset_ids)))
+        self.identity = self._identity()
+
+    def _identity(self) -> str:
+        return digest(dict(schema="rl-quant.raw-second-catalog-v2", windows=[w.identity for w in self.windows],
+                           source_sets=[s.identity for s in self.sources]))
+
+    def resolve(self, asset: str, start_ms: int, end_ms: int, *, require_complete: bool = True) -> ResolvedSecondInterval:
+        self.validate_identity()
+        return resolve_second_interval(self.sources[self.asset_ids.index(asset)], start_ms, end_ms,
+                                       require_complete=require_complete)
+
+    def validate_identity(self) -> None:
+        if self._identity() != self.identity:
+            raise ValueError("Raw reference catalog changed")
 
     def load(self, index: int, *, device: torch.device | str) -> RawSecondObservation:
         if type(index) is not int or not 0 <= index < len(self.windows):
             raise ValueError("Invalid raw reference index")
-        if digest([w.identity for w in self.windows]) != self.identity:
-            raise ValueError("Raw reference catalog changed")
+        self.validate_identity()
         return load_raw_second_window(self.windows[index], device=device)
 
     def identity_tensor(self, *, device: torch.device | str) -> torch.Tensor:

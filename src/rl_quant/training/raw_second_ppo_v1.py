@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 from rl_quant.datasets.massive_raw_seconds_v1 import SCHEMA, _read, _write
-from rl_quant.envs.raw_second_portfolio_v1 import RawSecondPortfolioEnv, SecondFill
+from rl_quant.envs.raw_second_portfolio_v1 import LEDGER_SCHEMA, RawSecondPortfolioEnv, SecondFill, SecondLedgerMark
 from rl_quant.execution.qt200_aggregate_execution_v1 import Book, Receivable
 from rl_quant.models.raw_second_policy_v1 import RawSecondActorCritic
 from rl_quant.rl.ppo import PPOConfig, RecurrentPPO
@@ -64,7 +64,7 @@ class RawSecondPPOTrainer:
 
     def save(self, path: Path) -> str:
         env = self.environment
-        state = dict(schema=SCHEMA, catalog=env.catalog.identity, model_contract=self.algorithm.model.get_extra_state(),
+        state = dict(schema=SCHEMA, ledger_schema=LEDGER_SCHEMA, catalog=env.catalog.identity, model_contract=self.algorithm.model.get_extra_state(),
                      execution_config=asdict(env.config), splits=[asdict(e) for e in env.splits],
                      dividends=[asdict(e) for e in env.dividends], sessions=[asdict(s) for s in env.sessions], algorithm=self.algorithm.state_dict(),
                      cpu_rng=torch.get_rng_state(),
@@ -74,8 +74,8 @@ class RawSecondPPOTrainer:
                                       holdings=[(a, str(q)) for a, q in env.book.holdings],
                                       receivables=[dict(event_id=r.event_id, instrument=r.instrument, payable_date=r.payable_date, amount=str(r.amount)) for r in env.book.receivables],
                                       applied_events=env.book.applied_events, action_date=env.book.action_date,
-                                      last_marks={a: str(p) for a, p in env.last_marks.items()},
-                                      known_marks={a: str(p) for a, p in env.known_marks.items()},
+                                      accounting_mark_state={a: {**asdict(m), "price": str(m.price)} for a, m in env.accounting_mark_state.items()},
+                                      known_mark_state={a: {**asdict(m), "price": str(m.price)} for a, m in env.known_mark_state.items()},
                                       peak=str(env.peak), risk_halted=env.risk_halted, equity=str(env.current_equity),
                                       fills=[asdict(f) for f in env.fills], audit=env.audit))
         # Decimal event terms are serialized as strings, not pickle globals.
@@ -92,7 +92,7 @@ class RawSecondPPOTrainer:
             raise ValueError("Use load_frozen_raw_second_policy; resume is never an evaluation interface")
         state = torch.load(io.BytesIO(_read(path, expected_sha256)), map_location=self.algorithm.device, weights_only=True)
         env = self.environment
-        if (state["schema"] != SCHEMA or state["catalog"] != env.catalog.identity
+        if (state["schema"] != SCHEMA or state.get("ledger_schema") != LEDGER_SCHEMA or state["catalog"] != env.catalog.identity
                 or state["model_contract"] != self.algorithm.model.get_extra_state()
                 or state["execution_config"] != asdict(env.config)
                 or state.get("sessions") != [asdict(s) for s in env.sessions]):
@@ -110,8 +110,8 @@ class RawSecondPPOTrainer:
         env.book = Book(Decimal(book["cash"]), tuple((a, Decimal(q)) for a, q in book["holdings"]),
                         tuple(Receivable(r["event_id"], r["instrument"], r["payable_date"], Decimal(r["amount"])) for r in book["receivables"]),
                         tuple(book["applied_events"]), book["action_date"])
-        env.last_marks = {a: Decimal(p) for a, p in book["last_marks"].items()}
-        env.known_marks = {a: Decimal(p) for a, p in book["known_marks"].items()}
+        env.accounting_mark_state = {a: SecondLedgerMark(**{**m, "price": Decimal(m["price"])}) for a, m in book["accounting_mark_state"].items()}
+        env.known_mark_state = {a: SecondLedgerMark(**{**m, "price": Decimal(m["price"])}) for a, m in book["known_mark_state"].items()}
         env.peak, env.current_equity = Decimal(book["peak"]), Decimal(book["equity"])
         env.risk_halted = book["risk_halted"]
         env.fills = [SecondFill(**f) for f in book["fills"]]

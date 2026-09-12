@@ -5,12 +5,13 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import torch
 
 from rl_quant.datasets.massive_raw_seconds_v1 import (
     CapturedSecondPage, RawSecondCatalog, RawSecondContract, RawSecondWindowRef,
-    SecondCaptureRef, SecondQuery, publish_second_capture,
+    SecondCaptureRef, SecondPartitionSet, SecondQuery, publish_second_capture,
 )
 from rl_quant.envs.raw_second_portfolio_v1 import RawSecondPortfolioEnv, SecondExecutionConfig
 from rl_quant.models.raw_second_policy_v1 import RawSecondActorCritic, RawSecondModelConfig
@@ -57,9 +58,12 @@ def event_coverage(root: Path, catalogs, *, splits=(), dividends=()):
     start = min(w.start_ms for c in catalogs for w in c.windows)
     end = max(w.decision_ms for c in catalogs for w in c.windows)
     sessions = []
-    for stamp in sorted({w.start_ms for c in catalogs for w in c.windows}):
-        session = datetime.fromtimestamp(stamp / 1000, timezone.utc).date().isoformat()
-        sessions.append(dict(session_date=session, open_ms=stamp, close_ms=stamp + 23_400_000))
+    days = {datetime.fromtimestamp(w.start_ms / 1000, ZoneInfo("America/New_York")).date()
+            for c in catalogs for w in c.windows}
+    for day in sorted(days):
+        opened = datetime(day.year, day.month, day.day, 9, 30, tzinfo=ZoneInfo("America/New_York"))
+        stamp = int(opened.timestamp()) * 1000
+        sessions.append(dict(session_date=day.isoformat(), open_ms=stamp, close_ms=stamp + 23_400_000))
     def terms(row):
         return {k: str(v) if k in ("shares_from", "shares_to", "cash_per_share") else v for k, v in asdict(row).items()}
     source = json.dumps(dict(splits=[terms(s) for s in splits], dividends=[terms(d) for d in dividends]), sort_keys=True).encode()
@@ -75,17 +79,23 @@ def event_coverage(root: Path, catalogs, *, splits=(), dividends=()):
 
 def save_catalog(catalog: RawSecondCatalog, path: Path):
     with path.open("x") as stream:
-        json.dump([asdict(w) for w in catalog.windows], stream, sort_keys=True)
+        json.dump(dict(windows=[asdict(w) for w in catalog.windows],
+                       execution_sources=[asdict(s) for s in catalog.execution_sources] if catalog.execution_sources else None),
+                  stream, sort_keys=True)
 
 
 def reopen_catalog(path: Path) -> RawSecondCatalog:
-    rows = json.loads(path.read_text())
+    body = json.loads(path.read_text())
+    rows = body["windows"]
+    def source(row):
+        return SecondPartitionSet(tuple(SecondCaptureRef(**c) for c in row["partitions"])) if "partitions" in row else SecondCaptureRef(**row)
     for row in rows:
-        row["captures"] = tuple(SecondCaptureRef(**c) for c in row["captures"])
+        row["captures"] = tuple(source(c) for c in row["captures"])
         row["asset_ids"] = tuple(row["asset_ids"])
         row["contract"]["market_fields"] = tuple(row["contract"]["market_fields"])
         row["contract"] = RawSecondContract(**row["contract"])
-    return RawSecondCatalog(tuple(RawSecondWindowRef(**r) for r in rows))
+    return RawSecondCatalog(tuple(RawSecondWindowRef(**r) for r in rows),
+                            execution_sources=tuple(source(s) for s in body["execution_sources"]) if body["execution_sources"] else None)
 
 
 def trainer(catalog: RawSecondCatalog, *, device="cuda:0") -> RawSecondPPOTrainer:

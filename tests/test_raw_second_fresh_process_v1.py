@@ -36,12 +36,13 @@ def test_fresh_gpu_resume_and_cpu_inference_without_live_parent_cuda(tmp_path):
     assert before == {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in tmp_path.rglob("*") if p.is_file()}
 
 
-def test_actual_held_out_report_replays_in_a_fresh_gpu_process(tmp_path):
+@pytest.mark.parametrize("prepare", ["prepare", "prepare-partitions"])
+def test_actual_held_out_report_replays_in_a_fresh_gpu_process(tmp_path, prepare):
     assert torch.cuda.is_available() and torch.cuda.device_count() == 1
     assert not torch.cuda.is_initialized(), "Invoke this module in a separate pytest process"
     script = Path(__file__).with_name("raw_second_experiment_probe.py")
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CUBLAS_WORKSPACE_CONFIG=":4096:8")
-    result = subprocess.run([sys.executable, "-B", str(script), "prepare", str(tmp_path)],
+    result = subprocess.run([sys.executable, "-B", str(script), prepare, str(tmp_path)],
                             env=env, capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stdout + result.stderr
     before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in tmp_path.rglob("*") if p.is_file()}
