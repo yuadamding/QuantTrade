@@ -114,7 +114,7 @@ def persisted_partitions(tmp_path_factory):
     config = replace(agent.environment.config, execution_session="regular-only", order_expiry="session-close")
     result = run_raw_second_experiment(training=catalogs[0], validation=catalogs[1], test=catalogs[2],
         economic_inputs=events, output=root / "run", device="cuda:0", model_config=agent.algorithm.model.config,
-        execution_config=config, ppo_config=agent.algorithm.config, rollout_steps=1)
+        execution_config=config, ppo_config=agent.algorithm.config, rollout_steps=2)
     return root, catalogs, events, config, result
 
 
@@ -122,6 +122,9 @@ def test_bounded_partitions_train_select_and_test_across_session_close(persisted
     root, catalogs, _, _, report = persisted_partitions
     assert report["execution_complete"] and not report["positive_profitability_authorization_eligible"]
     fitted = json.loads((root / "run/training.json").read_text())
+    plan = json.loads((root / "run/plan.json").read_text())
+    assert plan["rollout_schedule"] == [3]  # absorb the tail before any update
+    assert [row["metrics"]["learning_samples"] for row in fitted["updates"]] == [3]
     assert fitted["initial_parameter_sha256"] != fitted["final_parameter_sha256"]
     assert fitted["ledger"][0]["holdings"] == fitted["ledger"][1]["holdings"]
     assert fitted["ledger"][1]["holdings"]
@@ -221,6 +224,12 @@ def test_split_marks_and_order_sizing_use_current_share_basis(tmp_path, delayed)
 
 def test_split_basis_is_restored_by_exact_training_resume(tmp_path):
     catalog = _continuous_catalog(tmp_path / "sources", START, next_rows=False)
+    last = catalog.windows[-1]
+    # A second genuine post-split transition, not a singleton learning update.
+    extra = _capture(tmp_path / "later-empty", last.decision_ms, last.decision_ms + 8000, [])
+    parts = SecondPartitionSet((*last.captures[0].partitions, extra))
+    catalog = RawSecondCatalog((*catalog.windows,
+        replace(last, captures=(parts,), seconds=24, decision_ms=last.decision_ms + 8000)))
     events = event_coverage(tmp_path / "events", (catalog,),
         splits=(Split("split", "issue-apple", "2017-01-04", D(1), D(2)),))
     terms = events.load(catalog)
@@ -232,13 +241,13 @@ def test_split_basis_is_restored_by_exact_training_resume(tmp_path):
     path = tmp_path / "resume.pt"
     receipt = agent.save(path)
     first_marks = agent.environment.known_mark_state.copy()
-    first = agent.collect(steps=1)
+    first = agent.collect(steps=2)
     metrics = agent.update(first)
     restored = trainer(catalog)
     restored.environment = RawSecondPortfolioEnv(catalog, config=config, device="cuda:0", splits=terms[0], sessions=terms[2])
     restored.load(path, receipt)
     assert restored.environment.known_mark_state == first_marks
-    again = restored.collect(steps=1)
+    again = restored.collect(steps=2)
     assert restored.update(again) == metrics
     assert restored.environment.audit == agent.environment.audit
 

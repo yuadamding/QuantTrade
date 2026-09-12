@@ -6,6 +6,40 @@ forecast-control, engineered daily/minute, normalized ContextEncoder,
 five-minute AlphaHierarchical, and Hold-30 artifacts remain legacy evidence.
 Their receipts and results must not be rewritten or accepted by this schema.
 
+## Non-singleton learning contract
+
+Raw-second learning requires at least two valid samples per PPO update. A
+single sample becomes zero after rollout-wide advantage centering, so its
+parameter changes can reflect only entropy/value objectives, not the clipped
+reward-driven policy objective. The raw-second trainer rejects such an update
+before changing parameters, optimizer state or RNG. Single-transition collection
+remains available for non-learning diagnostics; it cannot authorize an update.
+The shared generic PPO implementation and its other experiment contracts are
+unchanged. Sequence length one and minibatches of one sequence remain valid
+when normalization uses multiple learning samples from the complete rollout.
+
+Both raw-second runners reject `rollout_steps < 2` and training catalogs with
+fewer than two scored transitions. They freeze the complete rollout schedule
+before collection. A would-be singleton tail is absorbed into the preceding
+block **before** collecting it under one behavior policy: nominal size two over
+five transitions produces `(2, 3)`, and nominal 63 over 64 produces `(64,)`.
+The nominal bound may therefore grow by exactly one; resource planning must
+allow this. No transition is dropped, duplicated or merged after an update.
+The actual sizes and learning-sample counts are persisted and checked at report
+replay. Learning changes use `raw-second-multitransition-ppo-v1`, chronological
+report v3 and engineering summary v2. Old resume checkpoints without this
+learning contract are rejected; old reports retain their original identities.
+Portable frozen-policy inference retains its existing interface and provenance.
+
+`test_raw_second_learning_v1.py` isolates the PPO policy objective with entropy
+and value-loss coefficients zero. Actual sampled actions, ledger rewards and
+GAE must produce finite nonzero gradients and parameter updates in the actor,
+input projection and every attention tier over seeds 17/29/43. This proves
+reward-objective gradient flow, **not** improvement in held-out profitability.
+Even a multi-sample batch may have equal advantages; sample count alone does
+not guarantee a nonzero policy gradient. A controlled economic-learning test,
+representative one-H100 profiling and actual-data evaluation remain separate.
+
 ## Implemented boundary
 
 `rl-quant.massive-raw-second-window-v1` admits Massive REST unadjusted second
@@ -199,7 +233,8 @@ python -B -m pytest -q -m lsf_gpu \
   tests/test_raw_second_capture_v1.py \
   tests/test_massive_raw_second_rl_v1.py \
   tests/test_raw_second_experiment_v1.py \
-  tests/test_raw_second_partitions_v1.py
+  tests/test_raw_second_partitions_v1.py \
+  tests/test_raw_second_learning_v1.py
 python -B -m pytest -q -m lsf_gpu tests/test_raw_second_fresh_process_v1.py
 ```
 

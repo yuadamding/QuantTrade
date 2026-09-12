@@ -20,7 +20,7 @@ from rl_quant.datasets.raw_second_economics_v1 import SecondEconomicInputs
 from rl_quant.envs.raw_second_portfolio_v1 import RawSecondPortfolioEnv, SecondExecutionConfig
 from rl_quant.models.raw_second_policy_v1 import RawSecondActorCritic, RawSecondModelConfig
 from rl_quant.rl.ppo import PPOConfig
-from rl_quant.training.raw_second_ppo_v1 import RawSecondPPOTrainer
+from rl_quant.training.raw_second_ppo_v1 import LEARNING_SCHEMA, RawSecondPPOTrainer, plan_raw_second_rollouts
 
 
 def run_raw_second_engineering_episode(
@@ -37,8 +37,7 @@ def run_raw_second_engineering_episode(
     target = torch.device(device)
     if target.type != "cuda" or not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise ValueError("Raw-second engineering training requires one assigned CUDA GPU")
-    if type(rollout_steps) is not int or rollout_steps <= 0:
-        raise ValueError("rollout_steps must be a positive integer")
+    schedule = plan_raw_second_rollouts(len(catalog.windows) - 1, rollout_steps)
     if not torch.are_deterministic_algorithms_enabled() or torch.backends.cuda.matmul.allow_tf32:
         raise ValueError("Establish deterministic FP32 runtime before the workflow")
     if output.exists():
@@ -53,9 +52,10 @@ def run_raw_second_engineering_episode(
                                 splits=splits, dividends=dividends, sessions=sessions)
     agent = RawSecondPPOTrainer(model, env, ppo_config)
     output.mkdir(parents=True, exist_ok=False)
+    plan = dict(learning_schema=LEARNING_SCHEMA, rollout_steps=rollout_steps, rollout_schedule=schedule)
+    _write(output / "learning-plan.json", json.dumps(plan, sort_keys=True, separators=(",", ":")).encode())
     updates, trajectory = [], []
-    while env.index < len(catalog.windows) - 1:
-        steps = min(rollout_steps, len(catalog.windows) - 1 - env.index)
+    for steps in schedule:
         buffer = agent.collect(steps=steps)
         batch = buffer.as_batch()
         for row in range(steps):
@@ -65,7 +65,8 @@ def run_raw_second_engineering_episode(
                                    reward_net_log_equity=float(batch.rewards[row, 0])))
         updates.append(agent.update(buffer))
     checkpoint_sha = agent.save(output / "checkpoint.pt")
-    summary = dict(schema="rl-quant.massive-raw-second-engineering-run-v1", catalog_sha256=catalog.identity,
+    summary = dict(schema="rl-quant.massive-raw-second-engineering-run-v2", catalog_sha256=catalog.identity,
+                   **plan,
                    asset_ids=catalog.asset_ids, input_contract=asdict(catalog.windows[0].contract),
                    model_config=asdict(model_config), execution_config=asdict(execution_config),
                    economic_inputs=asdict(economic_inputs), ledger=env.audit,

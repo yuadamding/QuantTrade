@@ -22,6 +22,31 @@ from rl_quant.rl.ppo import PPOConfig, RecurrentPPO
 from rl_quant.rl.trajectory import OnPolicyTrajectoryBuffer
 
 
+LEARNING_SCHEMA = "rl-quant.raw-second-multitransition-ppo-v1"
+
+
+def plan_raw_second_rollouts(transitions: int, rollout_steps: int) -> tuple[int, ...]:
+    """Plan before collecting: never drop a transition or mix behavior policies.
+
+    ``rollout_steps`` is nominal. A block absorbs a would-be singleton tail
+    before collection, so its maximum size is ``rollout_steps + 1``. The
+    complete schedule must be included in the experiment's frozen plan.
+    """
+    if type(rollout_steps) is not int or rollout_steps < 2:
+        raise ValueError("Raw-second learning requires rollout_steps >= 2")
+    if type(transitions) is not int or transitions < 2:
+        raise ValueError("Raw-second learning requires at least two transitions")
+    schedule = []
+    remaining = transitions
+    while remaining:
+        count = min(rollout_steps, remaining)
+        if remaining - count == 1:
+            count += 1
+        schedule.append(count)
+        remaining -= count
+    return tuple(schedule)
+
+
 class RawSecondPPOTrainer:
     def __init__(self, model: RawSecondActorCritic, environment: RawSecondPortfolioEnv,
                  config: PPOConfig | None = None):
@@ -60,11 +85,17 @@ class RawSecondPPOTrainer:
     def update(self, buffer: OnPolicyTrajectoryBuffer) -> dict:
         # One decision per learning sequence keeps raw recomputation bounded;
         # advantages were already calculated on the full chronological rollout.
-        return dict(self.algorithm.update(buffer.recurrent_sequences(sequence_length=1)))
+        batch = buffer.recurrent_sequences(sequence_length=1)
+        learning_samples = int(batch.loss_mask.sum().item())
+        if learning_samples < 2:
+            raise ValueError("Singleton PPO learning batch would erase the reward-driven policy objective")
+        metrics = dict(self.algorithm.update(batch))
+        return {**metrics, "learning_samples": learning_samples}
 
     def save(self, path: Path) -> str:
         env = self.environment
-        state = dict(schema=SCHEMA, ledger_schema=LEDGER_SCHEMA, catalog=env.catalog.identity, model_contract=self.algorithm.model.get_extra_state(),
+        state = dict(schema=SCHEMA, ledger_schema=LEDGER_SCHEMA, learning_schema=LEARNING_SCHEMA,
+                     catalog=env.catalog.identity, model_contract=self.algorithm.model.get_extra_state(),
                      execution_config=asdict(env.config), splits=[asdict(e) for e in env.splits],
                      dividends=[asdict(e) for e in env.dividends], sessions=[asdict(s) for s in env.sessions], algorithm=self.algorithm.state_dict(),
                      cpu_rng=torch.get_rng_state(),
@@ -92,7 +123,8 @@ class RawSecondPPOTrainer:
             raise ValueError("Use load_frozen_raw_second_policy; resume is never an evaluation interface")
         state = torch.load(io.BytesIO(_read(path, expected_sha256)), map_location=self.algorithm.device, weights_only=True)
         env = self.environment
-        if (state["schema"] != SCHEMA or state.get("ledger_schema") != LEDGER_SCHEMA or state["catalog"] != env.catalog.identity
+        if (state["schema"] != SCHEMA or state.get("ledger_schema") != LEDGER_SCHEMA
+                or state.get("learning_schema") != LEARNING_SCHEMA or state["catalog"] != env.catalog.identity
                 or state["model_contract"] != self.algorithm.model.get_extra_state()
                 or state["execution_config"] != asdict(env.config)
                 or state.get("sessions") != [asdict(s) for s in env.sessions]):
@@ -127,5 +159,6 @@ class RawSecondPPOTrainer:
 
         return write_frozen_raw_second_policy(self.algorithm.model, path,
             training_provenance=dict(catalog_sha256=self.environment.catalog.identity,
+                learning_schema=LEARNING_SCHEMA,
                 last_reward_timestamp_ms=self.environment.catalog.windows[self.environment.index].decision_ms,
                 optimizer_updates=self.algorithm.update_count, ppo_config=asdict(self.algorithm.config)))

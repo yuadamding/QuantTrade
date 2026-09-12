@@ -21,9 +21,9 @@ from rl_quant.evaluation.raw_second_policy_v1 import load_frozen_raw_second_poli
 from rl_quant.evaluation.raw_second_profitability_v1 import evaluate_raw_second_policy
 from rl_quant.models.raw_second_policy_v1 import RawSecondActorCritic, RawSecondModelConfig
 from rl_quant.rl.ppo import PPOConfig
-from rl_quant.training.raw_second_ppo_v1 import RawSecondPPOTrainer
+from rl_quant.training.raw_second_ppo_v1 import LEARNING_SCHEMA, RawSecondPPOTrainer, plan_raw_second_rollouts
 
-EXPERIMENT_SCHEMA = "rl-quant.raw-second-chronological-experiment-v2"
+EXPERIMENT_SCHEMA = "rl-quant.raw-second-chronological-experiment-v3"
 
 
 def _publish(path: Path, body: dict) -> str:
@@ -105,9 +105,9 @@ def run_raw_second_experiment(*, training: RawSecondCatalog, validation: RawSeco
     target = torch.device(device)
     if target.type != "cuda" or not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise ValueError("Training requires one assigned CUDA GPU; no CPU fallback")
-    if (not torch.are_deterministic_algorithms_enabled() or torch.backends.cuda.matmul.allow_tf32
-            or type(rollout_steps) is not int or rollout_steps < 1):
-        raise ValueError("Deterministic FP32 and a positive rollout bound required")
+    if not torch.are_deterministic_algorithms_enabled() or torch.backends.cuda.matmul.allow_tf32:
+        raise ValueError("Deterministic FP32 required")
+    schedule = plan_raw_second_rollouts(len(training.windows) - 1, rollout_steps)
     if cost_rungs != (10, 20, 40) or execution_config.cost_basis_points != 20:
         raise ValueError("Freeze primary 20-bp selection and 10/20/40-bp evaluation")
     catalogs = dict(train=training, validation=validation, test=test)
@@ -116,7 +116,8 @@ def run_raw_second_experiment(*, training: RawSecondCatalog, validation: RawSeco
     plan = dict(schema=EXPERIMENT_SCHEMA, splits=splits, asset_ids=training.asset_ids,
         economic_inputs=asdict(economic_inputs), input_contract=asdict(training.windows[0].contract),
         model_config=asdict(model_config), execution_config=asdict(execution_config), ppo_config=asdict(ppo_config),
-        rollout_steps=rollout_steps, cost_rungs=cost_rungs,
+        learning_schema=LEARNING_SCHEMA, rollout_steps=rollout_steps, rollout_schedule=schedule,
+        cost_rungs=cost_rungs,
         selection_rule="maximum-validation-net-return;earliest-update-breaks-ties",
         baseline_rule="cash;one-shot-entry-cap-matched-equal-weight-buy-and-hold;same-seed-untrained-policy")
     output.mkdir(parents=True, exist_ok=False)
@@ -129,8 +130,7 @@ def run_raw_second_experiment(*, training: RawSecondCatalog, validation: RawSeco
     initial_parameters = parameter_hash(model)
     untrained = dict(policy_file="untrained.pt", policy_sha256=agent.freeze(output / "untrained.pt"), update=0)
     candidates, updates = [], []
-    while env.index < len(training.windows) - 1:
-        count = min(rollout_steps, len(training.windows) - 1 - env.index)
+    for count in schedule:
         started = time.monotonic()
         buffer = agent.collect(steps=count)
         torch.cuda.synchronize(target)
@@ -173,7 +173,12 @@ def verify_raw_second_experiment(*, output: Path, expected_report_sha256: str,
     plan = _json(_read(output / "plan.json", report["plan_sha256"]))
     fitted = _json(_read(output / "training.json", report["training_sha256"]))
     selected = _json(_read(output / "selection.json", report["selection_sha256"]))
-    if (plan["schema"] != EXPERIMENT_SCHEMA or plan["splits"] != _split_metadata(dict(train=training, validation=validation, test=test))
+    if (report["schema"] != EXPERIMENT_SCHEMA or plan["schema"] != EXPERIMENT_SCHEMA
+            or plan.get("learning_schema") != LEARNING_SCHEMA
+            or plan.get("rollout_schedule") != list(plan_raw_second_rollouts(len(training.windows) - 1, plan["rollout_steps"]))
+            or [row["transitions"] for row in fitted["updates"]] != plan["rollout_schedule"]
+            or [row["metrics"].get("learning_samples") for row in fitted["updates"]] != plan["rollout_schedule"]
+            or plan["splits"] != _split_metadata(dict(train=training, validation=validation, test=test))
             or plan["economic_inputs"] != asdict(economic_inputs)):
         raise ValueError("Verification inputs differ from the frozen plan")
     for catalog in (training, validation, test):
