@@ -26,7 +26,10 @@ COLUMNS = (
     "size", "tape", "trf_id", "trf_timestamp",
 )
 NAMES = (*COLUMNS, "source_row_number")
-CANDIDATE_CODES = frozenset(("1", "8", "10", "12"))
+CANDIDATE_CODE_FAMILIES = {
+    "correction": (1, 12), "cancellation": (8, 10), "error": (7, 11),
+}
+CANDIDATE_CODES = frozenset(code for pair in CANDIDATE_CODE_FAMILIES.values() for code in pair)
 CLAIMS = {
     "source_data_qualified": False,
     "training_ready": False,
@@ -119,17 +122,25 @@ def _bound_file(path: Path, expected_sha256: str, expected_bytes: int,
 
 
 def _integer(raw: str) -> int | None:
-    return int(raw) if raw.isascii() and raw.isdecimal() else None
+    # Preserve the original lexeme separately; parsing selects candidates,
+    # never manufactures a trade ID or normalizes the grouping key. Bound the
+    # integer conversion so malformed very long fields cannot abort the census.
+    normalized = raw.lstrip("0") or "0"
+    if not raw or not raw.isascii() or not raw.isdecimal() or len(normalized) > 20:
+        return None
+    value = int(normalized)
+    return value if value < 2**64 else None
 
 
 def _group_observation(key: tuple[str, str], rows: list[dict[str, Any]]) -> dict[str, Any]:
     codes = [row["original_fields"]["correction"] for row in rows]
+    parsed_codes = [row["correction_code"] for row in rows]
     status = "ambiguous-candidate-group"
     if not key[0] or _integer(key[1]) is None:
         status = "missing-or-malformed-group-key"
     elif len(rows) == 1:
         status = "unmatched-candidate"
-    elif len(rows) == 2 and set(codes) in ({"8", "10"}, {"1", "12"}):
+    elif len(rows) == 2 and any(set(parsed_codes) == set(pair) for pair in CANDIDATE_CODE_FAMILIES.values()):
         status = "observed-code-pair-not-a-qualified-link"
     comparisons = []
     # Only a two-row comparison has a unique observed counterpart. More rows
@@ -144,6 +155,7 @@ def _group_observation(key: tuple[str, str], rows: list[dict[str, Any]]) -> dict
             "left_source_row_number": rows[0]["source_row_number"],
             "right_source_row_number": rows[1]["source_row_number"],
             "code_order_in_source": codes,
+            "parsed_code_order_in_source": parsed_codes,
             "different_original_fields": [name for name in COLUMNS if left[name] != right[name]],
             "right_minus_left_timestamp_ns": deltas,
             "same_provider_trade_id_text": left["id"] == right["id"],
@@ -241,7 +253,7 @@ def probe_qt200_correction_pairs_v1(
                 code_counts[code] += 1
                 if len(code_counts) > 256:
                     raise ValueError("Probe raw correction-code allocation exceeded")
-                if code not in CANDIDATE_CODES:
+                if _integer(code) not in CANDIDATE_CODES:
                     continue
                 candidate_code_rows += 1
                 key = (ticker, sequence)
@@ -278,6 +290,7 @@ def probe_qt200_correction_pairs_v1(
                     "source_row_number_semantics": "CSV record ordinal; header=1; first data=2",
                     "original_fields": original,
                     "original_fields_sha256": content_sha,
+                    "correction_code": _integer(original["correction"]),
                     "provider_trade_id": original["id"] or None,
                     "provider_trade_id_raw": original["id"],
                     "correction_target_reference": None,
@@ -302,6 +315,8 @@ def probe_qt200_correction_pairs_v1(
         "original_source_receipt_sha256": None if completion is None else completion.get("source_object_receipt_sha256"),
         "source_rows": expected_rows, "passes": 2,
         "raw_correction_code_counts": dict(sorted(code_counts.items())),
+        "candidate_code_families": CANDIDATE_CODE_FAMILIES,
+        "candidate_selection": "parsed-uint64-code;original-code-and-group-key-lexemes-preserved",
         "candidate_code_rows": candidate_code_rows,
         "candidate_key_count": len(groups), "retained_rows": retained_count,
         "retained_original_row_bytes": retained_bytes,

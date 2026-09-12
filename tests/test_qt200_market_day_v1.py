@@ -45,8 +45,12 @@ def _authorities():
                                    "updates_open_close": flags[0], "updates_high_low": flags[1], "updates_volume": flags[2]}}})
     conditions = build_massive_condition_authority(condition_rows, source_object_receipt_sha256="a" * 64,
                                                    source_query_path=MASSIVE_STOCK_TRADE_CONDITION_QUERY)
+    # Entirely synthetic forward-event contract. Code 2 exercises replacement
+    # mechanics, not any provider mapping. The legacy 12 rule remains present
+    # specifically to prove that it cannot override the historical guard.
     corrections = build_massive_correction_authority(
-        ((0, "new-trade"), (7, "new-trade"), (11, "cancellation"), (12, "replacement"), (9, "late-report")),
+        ((0, "new-trade"), (1, "new-trade"), (2, "replacement"), (7, "new-trade"),
+         (11, "cancellation"), (12, "replacement"), (9, "late-report")),
         canary_receipt_sha256="b" * 64,
     )
     session = MassiveExchangeSession(session_date="2017-01-03", exchange="XNYS", regular_open_ns=_at(9, 30),
@@ -104,7 +108,7 @@ def test_partial_indexes_preserve_complete_day_against_legacy_full_indexes(tmp_p
         _trade("ENDPOINT", 45, "30", "20", sequence=8),
         _trade("AFTER", 1, "1000", "1000", hour=16, sequence=9),
         _trade("CANCEL", 36, "10", "10.01", correction=11, sip_hour=17, sip_minute=0, sequence=10),
-        _trade("REPLACE", 37, "21", "3.5", correction=12, sip_hour=17, sip_minute=1, sequence=11),
+        _trade("REPLACE", 37, "21", "3.5", correction=2, sip_hour=17, sip_minute=1, sequence=11),
         _trade("LATE", 41, "21", "7", correction=9, sip_hour=17, sip_minute=2, sequence=12),
         _trade("DOT", 36, "25", "100", ticker="BRK.B", trf=1, tape=2, sequence=13),
         _trade("UNSELECTED", 36, "1", "1", ticker="OTHER", sequence=14),
@@ -158,8 +162,9 @@ def test_partial_indexes_preserve_complete_day_against_legacy_full_indexes(tmp_p
         assert not report["training_ready"] and not report["identity_qualified"]
 
 
-def test_replay_bar_tape_parity_and_v5_morning_fill(tmp_path: Path) -> None:
-    # All corrections are present; post-close reports change morning active state.
+def test_synthetic_terminal_replay_parity_is_not_decision_time_fill(tmp_path: Path) -> None:
+    # Synthetic post-close corrections change terminal morning statistics.
+    # These are explicitly not executable fills or decision-time observations.
     trades = [
         _trade("CANCEL", 36, "10", "100", correction=7, sequence=1),
         _trade("REPLACE", 37, "20", "100", sequence=2),
@@ -170,7 +175,7 @@ def test_replay_bar_tape_parity_and_v5_morning_fill(tmp_path: Path) -> None:
         _trade("ENDPOINT", 45, "30", "20", sequence=7),
         _trade("AFTER", 1, "1000", "1000", hour=16, sequence=8),
         _trade("CANCEL", 36, "10", "100", correction=11, sip_hour=17, sip_minute=0, sequence=9),
-        _trade("REPLACE", 37, "21", "120", correction=12, sip_hour=17, sip_minute=1, sequence=10),
+        _trade("REPLACE", 37, "21", "120", correction=2, sip_hour=17, sip_minute=1, sequence=10),
     ]
     report, rows, args = _run(tmp_path, trades)
     observed = report["rows"][0]
@@ -204,6 +209,11 @@ def test_replay_bar_tape_parity_and_v5_morning_fill(tmp_path: Path) -> None:
     assert observed["fill"]["vwap"] == 21.0
     assert observed["fill"]["share_volume"] == 120.0
     assert observed["fill"]["trade_count"] == 1
+    for view in (report, observed, observed["fill"]):
+        assert view["view"] == "terminal_corrected_diagnostic"
+        assert view["decision_time_qualified"] is False
+    assert observed["fill"]["execution_eligible"] is False
+    assert report["historical_correction_applicability_qualified"] is False
     assert observed["volume_forming_flow"]["share_volume"] == 160.0
     assert observed["price_volume_forming_flow"]["share_volume"] == 150.0
     assert observed["event_counts"]["cancellation"] == 1
@@ -230,7 +240,7 @@ def test_bad_ticker_day_keeps_source_rows_but_cannot_make_usable_data(tmp_path: 
     elif case == "missing-cancel":
         rows = [_trade("BAD", 36, "10", "1", correction=11)]
     elif case == "missing-replace":
-        rows = [_trade("BAD", 36, "10", "1", correction=12)]
+        rows = [_trade("BAD", 36, "10", "1", correction=2)]
     elif case == "conflicting-duplicate":
         rows = [_trade("BAD", 36, "10", "1"), _trade("BAD", 36, "20", "1", sequence=2)]
     else:
@@ -246,6 +256,46 @@ def test_bad_ticker_day_keeps_source_rows_but_cannot_make_usable_data(tmp_path: 
     assert day["legacy_tape_values"] == [0.0] * 15 and not any(day["legacy_tape_valid"])
     assert day["fill"]["vwap"] == 0 and not day["fill"]["valid"]
     assert not day["volume_forming_flow"]["valid"]
+
+
+@pytest.mark.parametrize("code", ["1", "01", "12", "012"])
+@pytest.mark.parametrize("trade_id", ["MATCHING-ID", ""])
+def test_generic_canary_cannot_authorize_historical_corrections(tmp_path: Path, code: str, trade_id: str) -> None:
+    import sqlite3
+
+    trades = [
+        _trade("MATCHING-ID", 36, "100", "10", sequence=1),
+        _trade(trade_id, 36, "101", "20", correction=code, sip_hour=17, sip_minute=0, sequence=2),
+        _trade("OTHER-ISSUE", 37, "25", "5", ticker="BRK.B", sequence=3),
+    ]
+    report, selected, args = _run(tmp_path, trades)
+    day = report["rows"][0]
+    assert len(selected) == report["selection_scan"]["selected_row_count"] == 3
+    assert selected[1].original_values[2] == code
+    issue = "historical_correction_applicability_unresolved"
+    if not trade_id:
+        issue += "_and_canonicalization_error"
+    assert day["errors"][issue] == 1
+    assert not day["source_selected_market_day_valid"]
+    assert not day["terminal_active_state_valid"]
+    assert not any(day["bars_valid"]) and not any(day["legacy_tape_valid"])
+    assert day["bars_values"] == [0.0] * 8
+    assert not day["fill"]["valid"] and not day["fill"]["execution_eligible"]
+    assert not day["volume_forming_flow"]["valid"]
+    assert not day["price_volume_forming_flow"]["valid"]
+    assert report["rows"][1]["source_selected_market_day_valid"]
+    assert not report["training_ready"] and not report["decision_time_qualified"]
+    # Prove preservation and non-application in the actual persisted spool,
+    # not only through the report's flags. The old payload is not replaced.
+    connection = sqlite3.connect(f"file:{report['spool']['path']}?mode=ro", uri=True)
+    try:
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 3
+        assert connection.execute("SELECT kind,active FROM events WHERE ordinal=3").fetchone() == (None, 0)
+        assert connection.execute("SELECT price FROM events WHERE ticker='AAA' AND active=1").fetchall() == [("100",)]
+    finally:
+        connection.close()
+    assert file_sha256(Path(report["spool"]["path"])) == report["spool"]["sha256"]
+    assert file_sha256(args["root"] / args["payload_relative_path"]) == args["expected_compressed_sha256"]
 
 
 def test_volume_only_trade_does_not_invent_price_or_fill(tmp_path: Path) -> None:

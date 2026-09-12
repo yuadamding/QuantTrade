@@ -2,7 +2,10 @@
 
 The original whole gzip remains a mandatory durable replay dependency. This
 bridge is not a native whole-market partition manifest or a cold-replay-ready
-training dataset. All selected events, including errors and complete correction
+training dataset. Its terminal corrected view is not a decision-time view.
+A generic correction-code canary does not establish historical applicability:
+01/12 remain blocked until orientation, linkage and revision timing are supported.
+All selected events, including errors and complete correction
 chains, remain in the provisional SQLite spool; successful cleanup is a separate
 caller-owned, receipt-gated operation. This module never deletes a spool.
 
@@ -32,6 +35,7 @@ import zlib
 from rl_quant.data_sources.massive.conditions import MassiveConditionAuthority
 from rl_quant.data_sources.massive.corrections import MassiveCorrectionAuthority
 from rl_quant.data_sources.massive.finalized_listing import coverage_session_from_massive_trade_key
+from rl_quant.data_sources.massive.qt200_historical_message_adapter_v1 import _uint64
 from rl_quant.data_sources.massive.selected_trade_scan_v1 import (
     MassiveSelectedOriginalTradeRowV1,
     MassiveSelectedTradeFileScanEvidenceV1,
@@ -52,6 +56,9 @@ QT200_MARKET_DAY_V1_SPEC_SHA256 = semantic_sha256({
     "source": "complete-original-gzip-exact-ticker-selection-v1",
     "replay_key": "source-ticker,exchange,trf-or-minus-one,trade-id",
     "replay_order": "sip,sequence,exchange,trf,trade-id,physical-source-row",
+    "view": "terminal_corrected_diagnostic",
+    "decision_time_qualified": False,
+    "historical_correction_applicability": "01/12-retained-unapplied-entire-ticker-day-masked;no-canary-override",
     "regular_domain": "participant-time-in-[calendar-open,calendar-close)-after-full-replay",
     "bars": "native-V0-separate-open-close,high-low,volume-condition-populations",
     "legacy_tape": "native-V0-all-known-condition-terminal-active-regular-trades",
@@ -249,6 +256,15 @@ class Qt200MarketDaySpoolV1:
 
     def _derive(self, row: MassiveSelectedOriginalTradeRowV1) -> tuple:
         ticker = row.original_values[0]
+        # Inspect the preserved lexeme even if the executable canonicalizer
+        # rejected this row (e.g. its provider ID is blank). Neither an ID nor
+        # a generic 12 -> replacement rule proves historical orientation or
+        # availability. There is deliberately no caller override for this gate.
+        if _uint64(row.original_values[2]) in {1, 12}:
+            issue = "historical_correction_applicability_unresolved"
+            if row.extracted_row is None:
+                issue += "_and_canonicalization_error"
+            return (ticker,) + (None,) * (len(_DERIVED) - 2) + (issue,)
         if row.extracted_row is None:
             return (ticker,) + (None,) * (len(_DERIVED) - 2) + ("canonicalization_error",)
         trade = row.extracted_row.canonical_record
@@ -481,6 +497,8 @@ class Qt200MarketDaySpoolV1:
         fill_valid = usable and fill["count"] > 0 and fill["shares"] > 0 and fill["dollars"] > 0
         result = {
             "ticker": ticker, "security_id": None, "identity_qualified": False,
+            "view": "terminal_corrected_diagnostic", "decision_time_qualified": False,
+            "historical_correction_applicability_qualified": False,
             "source_selected_market_day_valid": usable, "observed_source_rows": sum(summary["counts"].values()),
             "errors": dict(self.issues[ticker]), "bounded_error_samples": self.samples[ticker],
             "event_counts": dict(summary["counts"]), "regular_participant_event_counts": dict(summary["regular_counts"]),
@@ -495,6 +513,8 @@ class Qt200MarketDaySpoolV1:
             "volume_forming_flow": _flow_result(volume_flow, "native-V2-volume-forming", usable),
             "price_volume_forming_flow": _flow_result(price_volume_flow, "price-and-volume-forming", usable),
             "fill": {"window": "[09:35,09:45)-America/New_York", "valid": fill_valid,
+                     "view": "terminal_corrected_diagnostic", "decision_time_qualified": False,
+                     "execution_eligible": False,
                      "start_ns": self.fill_start, "end_ns": self.fill_end,
                      "vwap": float(fill["dollars"] / fill["shares"]) if fill_valid else 0.0,
                      "share_volume": float(fill["shares"]) if fill_valid else 0.0,
@@ -551,6 +571,8 @@ class Qt200MarketDaySpoolV1:
         self._check("sealed", self.count)
         report = {
             "schema": QT200_MARKET_DAY_V1_SCHEMA, "session_date": self.session.session_date,
+            "view": "terminal_corrected_diagnostic", "decision_time_qualified": False,
+            "historical_correction_applicability_qualified": False,
             "source_selected_processing_complete": True,
             "whole_source_canonical_scan_qualified": False, "identity_qualified": False,
             "native_daily_input_authority": False, "cold_replay_ready_without_original_gzip": False,

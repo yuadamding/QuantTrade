@@ -4,6 +4,12 @@ This index separates current scientific contracts from development-only
 training guides and immutable historical records. Documentation and local
 tests are not launch or performance evidence.
 
+For the primary learning direction, start with
+[Massive raw-second Transformer/direct-allocation PPO](massive_raw_second_rl_v1.md).
+This supersedes engineered market inputs for new primary experiments, not the
+identities or interpretation of earlier results. Its qualification is separate
+from native V5 and from daily/minute preparation.
+
 For the fixed 200-equity data preparation path, read
 [QT200 inputs for adaptive V5 PPO](qt200_v5_training_data.md). It distinguishes
 the legacy intraday loader from the native V5 source graph and records the

@@ -71,9 +71,10 @@ must never be used to bypass those requirements.
 
 ## Historical correction orientation and native preflight
 
-The provider's [correction glossary](https://massive.com/glossary/conditions-indicators)
+The provider's NYSE [correction glossary](https://massive.com/glossary/conditions-indicators)
 describes retrospective encoding: code 01 carries corrected values at original
 time, while code 12 carries original incorrect values at correction time.
+This does not prove applicability to every historical export or venue.
 Do not treat this pair as a forward new-trade/replacement stream. The QT200
 native prerequisite now blocks 01/12 until their historical representation,
 predecessor linkage and revision availability are qualified. Other native
@@ -90,3 +91,18 @@ two bounded passes. It retains all rows sharing a candidate raw ticker/sequence
 key, including ordinary/unknown-code collisions, without choosing a correction
 target or discarding ambiguity. Parquet values do not reproduce original CSV
 quoting or raw-line hashes; those remain tied to the preserved gzip.
+
+Candidate selection parses a bounded unsigned integer independently of the
+preserved raw code. The declared diagnostic families are 1/12, 8/10 and 7/11;
+zero padding therefore cannot hide a candidate. Raw ticker/sequence keys are
+not normalized. Pair classification remains observational, including when IDs
+match: no economic roles, correction targets or revision times are inferred.
+
+The selected market-day spool also blocks 01/12, including rows rejected by
+canonicalization for blank IDs. It retains the original rows without applying
+the unsupported update, invalidates all dependent ticker-day masks, and labels
+every output `terminal_corrected_diagnostic`, never decision-time-qualified.
+Synthetic forward-replacement regression cases use an explicitly synthetic
+contract; their success is not historical correction qualification. Full-file
+native preflight still checks off-panel records. No panel-scoped authority or
+compact-Parquet-to-native-input promotion is introduced by these changes.

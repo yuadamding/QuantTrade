@@ -5,7 +5,6 @@ import copy
 import json
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest

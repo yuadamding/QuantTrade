@@ -7,7 +7,6 @@ import gzip
 import hashlib
 import io
 import json
-from pathlib import Path
 import resource
 
 import pytest

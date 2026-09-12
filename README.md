@@ -1,5 +1,11 @@
 # QuantTrade
 
+The primary market-learning direction is now
+[raw one-second OHLCV → trainable Transformer → direct-allocation PPO](docs/massive_raw_second_rl_v1.md).
+No engineered market features or raw-field normalization precede its learned
+input projection. The new engineering path is separate from the retained
+legacy workflows below; real second-bar data and GPU acceptance remain gates.
+
 QuantTrade (`rl_quant`) is a torch-native **general deep-reinforcement-learning library** with a historical
 portfolio environment and market-research components. Its RL contracts are domain-neutral: observations,
 actions, transitions, trajectories, and algorithms do not import market code. Portfolio allocation is the first

@@ -113,8 +113,16 @@ The current source adapters deliberately expose distinct intermediate products:
   snapshot is insufficient to establish tradability or continuous identity.
 - `qt200_market_day_v1` consumes every provisional selected original trade
   into a bounded disk spool, reconciles it to full-gzip completion, replays
-  corrections, then emits bars, legacy tape, separately labeled volume and
-  price-plus-volume flows, and the V5 morning-fill population. An invalid
+  supported diagnostic rules, then emits bars, legacy tape, separately labeled
+  volume and price-plus-volume flows, and morning-window statistics. All
+  outputs carry `view=terminal_corrected_diagnostic` and
+  `decision_time_qualified=false`; even a statistically valid morning-window
+  result has `execution_eligible=false`. Post-close corrections can change
+  these terminal statistics, so they must not feed earlier observations or fills.
+  Retrospective codes 01/12 are preserved but never applied: a generic canary
+  mapping cannot establish historical orientation, linkage or revision timing,
+  even for matching nonblank IDs. The entire affected ticker-day is masked.
+  No historical-applicability override is exposed. An invalid
   ticker-day keeps its evidence and explicit false masks. The compact report
   remains dependent on the original gzip; it is not a native partition archive
   or a replacement for qualified daily-input authorities.

@@ -60,6 +60,52 @@ def test_second_pass_includes_ordinary_and_unknown_code_collisions(tmp_path):
     assert group["comparisons"] == [] and result["source_rows"] == 5
 
 
+@pytest.mark.parametrize("codes", [("01", "012"), ("08", "010"), ("7", "11"), ("007", "011")])
+def test_padded_and_error_family_candidates_preserve_raw_codes(tmp_path, codes):
+    result = probe.probe_qt200_correction_pairs_v1(**_arguments(tmp_path, [
+        _row(codes[0], ordinal=2), _row(codes[1], ordinal=3),
+    ]))
+    group = result["groups"][0]
+    assert result["candidate_code_rows"] == result["retained_rows"] == 2
+    assert result["raw_correction_code_counts"] == dict.fromkeys(codes, 1)
+    assert group["status"] == "observed-code-pair-not-a-qualified-link"
+    assert [row["original_fields"]["correction"] for row in group["rows"]] == list(codes)
+    assert [row["correction_code"] for row in group["rows"]] == [int(code) for code in codes]
+    assert group["comparisons"][0]["parsed_code_order_in_source"] == [int(code) for code in codes]
+    assert group["correction_target_reference"] is None
+    assert result["candidate_code_families"] == {
+        "correction": (1, 12), "cancellation": (8, 10), "error": (7, 11)}
+    assert all(result[key] is value for key, value in probe.CLAIMS.items())
+
+
+@pytest.mark.parametrize("code", ["7", "011"])
+def test_each_error_family_member_seeds_groups_and_retains_collisions(tmp_path, code):
+    result = probe.probe_qt200_correction_pairs_v1(**_arguments(tmp_path, [
+        _row(code, ordinal=2), _row("0", ordinal=3), _row("99", ordinal=4),
+    ]))
+    assert result["candidate_code_rows"] == 1 and result["retained_rows"] == 3
+    group = result["groups"][0]
+    assert group["status"] == "ambiguous-candidate-group"
+    assert group["comparisons"] == []
+    assert group["correction_target_reference"] is None
+
+
+@pytest.mark.parametrize("code", ["", " 01", "+1", "1.0", "-7", "１２", str(2**64), "9" * 5000])
+def test_invalid_codes_remain_visible_but_do_not_seed_candidates(tmp_path, code):
+    result = probe.probe_qt200_correction_pairs_v1(**_arguments(tmp_path, [_row(code)]))
+    assert result["raw_correction_code_counts"] == {code: 1}
+    assert result["candidate_code_rows"] == 0 and result["groups"] == []
+
+
+def test_long_zero_padding_does_not_overflow_integer_conversion(tmp_path):
+    code = "0" * 5000 + "7"
+    result = probe.probe_qt200_correction_pairs_v1(**_arguments(tmp_path, [_row(code)]))
+    row = result["groups"][0]["rows"][0]
+    assert row["original_fields"]["correction"] == code
+    assert row["correction_code"] == 7
+    assert result["candidate_code_rows"] == 1
+
+
 def test_missing_and_unmatched_keys_are_not_resolved(tmp_path):
     result = probe.probe_qt200_correction_pairs_v1(**_arguments(tmp_path, [
         _row("10", ordinal=2), _row("12", sequence="", ordinal=3),
