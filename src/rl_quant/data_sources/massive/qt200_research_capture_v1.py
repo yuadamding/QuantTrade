@@ -277,12 +277,20 @@ def capture_pilot(*, root: Path, api_key: str, plan_sha256: str) -> dict:
 def _capture_queries(*, root: Path, api_key: str, plan_sha256: str,
                      queries: tuple[PilotQuery, ...], schema: str,
                      maximum_bytes: int, maximum_pages: int,
-                     request_pacer: RequestPacer | None = None) -> dict:
+                     request_pacer: RequestPacer | None = None,
+                     _packed_sink: object | None = None) -> dict:
     """Shared transport implementation; public entry points freeze their scope."""
     if not isinstance(api_key, str) or not api_key or any(c.isspace() for c in api_key):
         raise ResearchCaptureError("Malformed acquisition credential")
     if request_pacer is not None and type(request_pacer) is not RequestPacer:
         raise ResearchCaptureError("Request pacer must be the package-owned implementation")
+    if _packed_sink is not None:
+        from rl_quant.data_sources.massive.raw_second_direct_capture_v1 import _DirectSecondSink
+        if type(_packed_sink) is not _DirectSecondSink:
+            raise ResearchCaptureError("Packed storage requires the exact package-owned second sink")
+        _packed_sink.validate_scope(root, plan_sha256, queries, schema, maximum_bytes, maximum_pages)
+    elif schema == "rl-quant.raw-second-rest-packed-capture-v1":
+        raise ResearchCaptureError("Direct packed schema requires its explicit second sink")
     plan_raw = read_regular(root / "plan.json", 1024 * 1024)
     plan = parse_json(plan_raw)
     if (digest(plan_raw) != plan_sha256 or plan.get("schema") != schema + "-plan"
@@ -301,9 +309,14 @@ def _capture_queries(*, root: Path, api_key: str, plan_sha256: str,
     totals, results, bytes_used = [], [], 0
     deadline = time.monotonic() + MAX_CAPTURE_SECONDS
     try:
+        if _packed_sink is not None:
+            _packed_sink.start()
         for query in queries:
             query_root = root / query.name
-            query_root.mkdir(mode=0o700)
+            if _packed_sink is None:
+                query_root.mkdir(mode=0o700)
+            else:
+                _packed_sink.begin_query(query)
             url, visited, pages = query.url, set(), []
             while url is not None:
                 if time.monotonic() >= deadline:
@@ -313,28 +326,38 @@ def _capture_queries(*, root: Path, api_key: str, plan_sha256: str,
                     raise ResearchCaptureError("Pagination loop or page budget exhausted")
                 if shutil.disk_usage(root).free < 2 * MAX_PAGE_BYTES + 1024 * 1024:
                     raise ResearchCaptureError("Insufficient capture filesystem space")
+                if _packed_sink is not None:
+                    _packed_sink.before_request(url)
                 visited.add(url)
                 if request_pacer is not None:
                     request_pacer.acquire(deadline=deadline)
+                if _packed_sink is not None:
+                    _packed_sink.request_started()
                 raw, metadata = _fetch(url, query, api_key)
                 bytes_used += len(raw)
                 if bytes_used > maximum_bytes:
                     raise ResearchCaptureError("Capture byte budget exhausted")
                 # Preserve even a provider error response, but never mark it complete.
-                body_proof = write_once(query_root / f"page-{len(pages):04d}.json.gz",
-                                        gzip.compress(raw, compresslevel=9, mtime=0))
-                page = {"schema": schema + "-page", **metadata,
-                        "page_index": len(pages), "raw_body_sha256": digest(raw),
-                        "raw_body_bytes": len(raw), "body": body_proof,
-                        "predecessor_page_sha256": pages[-1]["sha256"] if pages else None,
-                        "plan_sha256": plan_sha256, "query": asdict(query),
-                        "capture_time_is_historical_availability": False}
-                proof = write_once(query_root / f"page-{len(pages):04d}.receipt.json", canonical(page))
+                if _packed_sink is None:
+                    body_proof = write_once(query_root / f"page-{len(pages):04d}.json.gz",
+                                            gzip.compress(raw, compresslevel=9, mtime=0))
+                    page = {"schema": schema + "-page", **metadata,
+                            "page_index": len(pages), "raw_body_sha256": digest(raw),
+                            "raw_body_bytes": len(raw), "body": body_proof,
+                            "predecessor_page_sha256": pages[-1]["sha256"] if pages else None,
+                            "plan_sha256": plan_sha256, "query": asdict(query),
+                            "capture_time_is_historical_availability": False}
+                    proof = write_once(query_root / f"page-{len(pages):04d}.receipt.json", canonical(page))
+                else:
+                    page, proof = _packed_sink.preserve_page(query, raw, metadata, len(pages),
+                        pages[-1]["sha256"] if pages else None)
                 if metadata["http_status"] != 200:
                     raise ResearchCaptureError("Provider request failed; no retry was issued")
                 summary = query.inspect_page(raw)
                 pages.append(proof)
                 totals.append({"query": query.name, "page": page["page_index"], **summary})
+                if _packed_sink is not None:
+                    _packed_sink.check_census(totals)
                 url = summary["next_url"]
                 time.sleep(0.3)
             complete = {"schema": schema + "-query-complete", "query": asdict(query),
@@ -343,11 +366,16 @@ def _capture_queries(*, root: Path, api_key: str, plan_sha256: str,
                         "result_count": sum(row["result_count"] for row in totals if row["query"] == query.name),
                         "empty_provider_response_proves_no_trading": False,
                         "point_in_time_qualified": False, "training_ready": False}
-            proof = write_once(query_root / "COMPLETE.json", canonical(complete))
+            if _packed_sink is None:
+                proof = write_once(query_root / "COMPLETE.json", canonical(complete))
+            else:
+                proof = _packed_sink.finish_query(complete)
             results.append({"query": query.name, "completion": proof,
                             "page_count": len(pages), "result_count": complete["result_count"]})
             print(json.dumps({"query_complete": query.name, "pages": len(pages),
                               "records": complete["result_count"]}), flush=True)
+        if _packed_sink is not None:
+            return _packed_sink.complete(results, totals, bytes_used, deadline)
         census = write_once(root / "page-census.json", canonical(totals))
         result = {"schema": schema + "-complete", "plan_sha256": plan_sha256,
                   "queries": results, "query_count": len(results), "page_census": census,
@@ -359,12 +387,20 @@ def _capture_queries(*, root: Path, api_key: str, plan_sha256: str,
         return result
     except Exception as exc:
         # Never serialize exception text or request objects: they may hold auth.
-        write_once(root / "BLOCKED.json", canonical({"schema": schema + "-blocked",
+        failure = {"schema": schema + "-blocked",
                    "plan_sha256": plan_sha256, "completed_queries": results,
                    "error_type": type(exc).__name__, "raw_response_bytes": bytes_used,
                    "capture_complete": False, "training_ready": False,
-                   "failed_at_ns": time.time_ns(), "retry_issued": False}))
+                   "failed_at_ns": time.time_ns(), "retry_issued": False}
+        if _packed_sink is not None:
+            failure.update(http_attempts=_packed_sink.http_attempts,
+                completed_packed_frames=_packed_sink.completed_frames,
+                partial_packed_evidence_may_exist=True, packed_cleanup_issued=False)
+        write_once(root / "BLOCKED.json", canonical(failure))
         raise ResearchCaptureError("Capture incomplete; inspect secret-free retained receipts") from None
+    finally:
+        if _packed_sink is not None:
+            _packed_sink.close()
 
 
 def replay_pilot(*, root: Path, plan_sha256: str, completion_sha256: str) -> dict:

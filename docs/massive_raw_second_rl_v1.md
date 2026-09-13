@@ -76,6 +76,12 @@ Positive actual-market returns are never an engineering acceptance requirement.
 
 ## Implemented boundary
 
+The [full-history QT200 preparation extension](qt200_raw_second_corpus_preparation.md)
+adds bounded compressed source access, explicit dated issue-routing checks and
+resumable preparation tranches. It does not change the market-input or model
+contract, qualify historical identities, or authorize a bulk acquisition or
+training run. Direct packed HTTP acquisition remains a separate storage step.
+
 `rl-quant.massive-raw-second-window-v1` admits Massive REST unadjusted second
 aggregates only. `SecondQuery` constructs `/v2/aggs/ticker/{ticker}/range/1/second/{from}/{to}`
 with `adjusted=false&sort=asc&limit=50000`. The offline capture handoff checks

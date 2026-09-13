@@ -220,7 +220,7 @@ class SecondCaptureRef:
     path: str
     manifest_sha256: str
 
-    def load(self) -> tuple[SecondQuery, tuple[CapturedSecondPage, ...]]:
+    def _manifest(self) -> dict:
         root = Path(self.path)
         manifest = _json(_read(root / "capture.json", self.manifest_sha256))
         if set(manifest) != {"schema", "query", "pages", "interpretation"} or manifest["schema"] != SCHEMA:
@@ -230,6 +230,15 @@ class SecondCaptureRef:
         names = {"capture.json", *(f"page-{i:06d}.json" for i in range(len(manifest["pages"])))}
         if {p.name for p in root.iterdir()} != names:
             raise ValueError("Unexpected source artifact (scalers/features are forbidden)")
+        return manifest
+
+    def query(self) -> SecondQuery:
+        """Hash-bound interval metadata; does not open unrelated page bodies."""
+        return SecondQuery(**self._manifest()["query"])
+
+    def load(self) -> tuple[SecondQuery, tuple[CapturedSecondPage, ...]]:
+        root = Path(self.path)
+        manifest = self._manifest()
         query = SecondQuery(**manifest["query"])
         pages = tuple(CapturedSecondPage(row["request_url"], row["received_at_ms"],
                       _read(root / f"page-{index:06d}.json", row["sha256"]))
@@ -258,6 +267,21 @@ def publish_second_capture(root: Path, query: SecondQuery, pages: tuple[Captured
     return SecondCaptureRef(str(root), sha256(body).hexdigest())
 
 
+def _is_second_capture(value: object) -> bool:
+    if type(value) is SecondCaptureRef:
+        return True
+    from rl_quant.datasets.massive_raw_second_packed_v1 import PackedSecondCaptureRef
+    return type(value) is PackedSecondCaptureRef
+
+
+def second_capture_ref_from_dict(value: dict) -> SecondCaptureRef:
+    """Restore explicit storage representations, never a permissive fallback."""
+    if type(value) is dict and set(value) == {"path", "manifest_sha256"}:
+        return SecondCaptureRef(**value)
+    from rl_quant.datasets.massive_raw_second_packed_v1 import PackedSecondCaptureRef
+    return PackedSecondCaptureRef.from_dict(value)
+
+
 @dataclass(frozen=True)
 class SecondPartitionSet:
     """One instrument's immutable source partitions, not a merged provider response.
@@ -270,7 +294,7 @@ class SecondPartitionSet:
 
     def __post_init__(self) -> None:
         if (type(self.partitions) is not tuple or not self.partitions
-                or any(type(p) is not SecondCaptureRef for p in self.partitions)
+                or any(not _is_second_capture(p) for p in self.partitions)
                 or len({p.manifest_sha256 for p in self.partitions}) != len(self.partitions)):
             raise ValueError("Unique immutable second partitions are required")
 
@@ -281,7 +305,7 @@ class SecondPartitionSet:
 
 
 def second_partitions(source: SecondCaptureRef | SecondPartitionSet) -> tuple[SecondCaptureRef, ...]:
-    if type(source) is SecondCaptureRef:
+    if _is_second_capture(source):
         return (source,)
     if type(source) is SecondPartitionSet:
         return source.partitions
@@ -321,13 +345,18 @@ def resolve_second_interval(source: SecondCaptureRef | SecondPartitionSet, start
     ticker = None
     previous = []
     for capture in second_partitions(source):
-        query, pages = capture.load()
+        # Both storage representations authenticate their query metadata before
+        # opening/decompressing prices. Whole-source replay is a separate gate.
+        query = capture.query()
         if ticker is not None and ticker != query.ticker:
             raise ValueError("Mixed ticker partitions cannot establish an issue identity")
         ticker = query.ticker
         left, right = max(start_ms, query.start_ms), min(end_ms, query.end_ms + 1000)
         if left >= right:
             continue
+        loaded_query, pages = capture.load()
+        if loaded_query != query:
+            raise ValueError("Source query changed between metadata and page reads")
         rows = {t: (values, receipt) for t, values, receipt in _rows(query, pages) if left <= t < right}
         for old_left, old_right, old_rows in previous:
             overlap_left, overlap_right = max(left, old_left), min(right, old_right)
@@ -379,7 +408,7 @@ class RawSecondWindowRef:
 
     @property
     def identity(self) -> str:
-        return digest(dict(schema=SCHEMA, captures=[c.manifest_sha256 if type(c) is SecondCaptureRef else c.identity for c in self.captures],
+        return digest(dict(schema=SCHEMA, captures=[c.manifest_sha256 if _is_second_capture(c) else c.identity for c in self.captures],
                            asset_ids=self.asset_ids, start_ms=self.start_ms, seconds=self.seconds,
                            decision_ms=self.decision_ms, contract=asdict(self.contract)))
 
